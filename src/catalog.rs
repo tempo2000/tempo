@@ -1223,6 +1223,19 @@ impl CatalogStore {
         enqueue_metadata_job(&connection, entity_type, entity_id, job_type, now_millis())
     }
 
+    /// Run `PRAGMA optimize` on the pooled connection. SQLite uses this
+    /// hook to update internal statistics and maintain stat indexes
+    /// when needed. Cheap on no-op runs (the recommended pattern is to
+    /// invoke it at shutdown). Failures are ignored on purpose -- there
+    /// is nothing useful to do with the error during teardown.
+    pub fn run_optimize(&self) {
+        let _span = perf::span("catalog.run_optimize", "");
+        let Ok(connection) = self.lock_connection() else {
+            return;
+        };
+        let _ = connection.execute_batch("PRAGMA optimize;");
+    }
+
     pub fn reset_stale_metadata_jobs(&self) -> Result<usize> {
         let connection = self.lock_connection()?;
         let now = now_millis();
