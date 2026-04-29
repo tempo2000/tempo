@@ -601,6 +601,7 @@ pub(super) fn volume_speaker_icon(waves: usize, colors: ThemeColors) -> AnyEleme
 /// pill (when applicable), and elapsed/duration labels. Click emits
 /// [`PlayerEvent::RequestSeekFromWaveformClick`] — the parent does
 /// the backend-empty restart logic that needs `tracks`.
+#[allow(clippy::too_many_arguments)]
 fn waveform_seekbar(
     elapsed: SharedString,
     duration: SharedString,

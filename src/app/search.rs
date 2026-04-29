@@ -440,12 +440,6 @@ impl TempoApp {
 
         // Fill missing anchors via linear interpolation so the rail is
         // monotonically increasing and visually evenly distributed.
-        let mut last_known: Option<(usize, f32)> = None;
-        for ix in 0..anchors.len() {
-            if let Some(ratio) = anchors[ix] {
-                last_known = Some((ix, ratio));
-            }
-        }
         let mut next_known: Vec<Option<(usize, f32)>> = vec![None; anchors.len()];
         let mut seen: Option<(usize, f32)> = None;
         for ix in (0..anchors.len()).rev() {
@@ -470,10 +464,8 @@ impl TempoApp {
                 _ => Some(ix as f32 / (anchors.len() - 1).max(1) as f32),
             };
         }
-        let _ = last_known;
-
         RAIL.iter()
-            .zip(anchors.into_iter())
+            .zip(anchors)
             .map(|(ch, ratio)| ScrollbarMarker {
                 ratio: ratio.unwrap_or(0.0).clamp(0.0, 1.0),
                 label: ch.to_string(),

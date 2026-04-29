@@ -2133,7 +2133,7 @@ impl CatalogStore {
         // `ORDER BY ... COLLATE NOCASE` produced from SQL; the synthetic
         // (featured-artist) entries don't have a SQL position so we
         // re-sort the merged result.
-        artists.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        artists.sort_by_key(|left| left.name.to_lowercase());
         perf::event(
             "catalog.load_artists.count",
             format!("artists={}", artists.len()),
@@ -2613,7 +2613,7 @@ fn first_collaborator(artist: &str) -> &str {
 /// ampersand is part of the name, not a separator.
 fn split_collaborators(artist: &str) -> impl Iterator<Item = &str> {
     artist
-        .split(|ch: char| matches!(ch, '/' | '\\' | ';'))
+        .split(['/', '\\', ';'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
 }

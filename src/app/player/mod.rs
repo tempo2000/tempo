@@ -47,10 +47,10 @@ impl TempoApp {
     pub(super) fn handle_player_event(&mut self, event: &PlayerEvent, cx: &mut Context<Self>) {
         match event {
             PlayerEvent::PlayingTrackChanged { path } => {
-                if let Some(path) = path {
-                    if let Some(&ix) = self.track_path_index.get(path) {
-                        self.playing_track = ix;
-                    }
+                if let Some(path) = path
+                    && let Some(&ix) = self.track_path_index.get(path)
+                {
+                    self.playing_track = ix;
                 }
                 cx.notify();
             }

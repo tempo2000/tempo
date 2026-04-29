@@ -455,8 +455,8 @@ impl TrackDrag {
     fn new(track_ix: usize, track: &Track) -> Self {
         Self {
             track_ix,
-            title: track.title.clone().into(),
-            artist: track.artist.clone().into(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
             position: gpui::Point::default(),
         }
     }
@@ -1717,7 +1717,7 @@ impl TempoApp {
     /// Confirm and perform the playlist deletion. Closes any open tabs
     /// referencing this playlist and shifts indices in surviving tabs
     /// + saved state so all `TabSource::Playlist(ix)` references stay
-    /// valid.
+    ///   valid.
     fn confirm_delete_playlist(&mut self) {
         let Some(playlist_ix) = self.playlist_delete_confirm.take() else {
             return;
