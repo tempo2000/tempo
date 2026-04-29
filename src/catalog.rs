@@ -29,11 +29,14 @@ pub struct CatalogTrack {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub track_number: Option<u32>,
     pub year: Option<String>,
+    pub date_added: SystemTime,
     pub duration: Duration,
     pub codec: String,
     pub bitrate: Option<u32>,
     pub file_size: u64,
+    pub play_count: u32,
     pub artwork_path: Option<PathBuf>,
 }
 
@@ -233,7 +236,9 @@ impl CatalogStore {
                 title TEXT NOT NULL,
                 artist_name TEXT NOT NULL,
                 album_name TEXT NOT NULL,
+                track_number INTEGER,
                 year TEXT,
+                date_added INTEGER NOT NULL,
                 duration_ms INTEGER NOT NULL,
                 codec TEXT NOT NULL,
                 bitrate INTEGER,
@@ -243,6 +248,9 @@ impl CatalogStore {
                 modified_at INTEGER,
                 artwork_asset_id INTEGER REFERENCES assets(id),
                 artwork_path TEXT,
+                play_count INTEGER NOT NULL DEFAULT 0,
+                first_played_at INTEGER,
+                last_played_at INTEGER,
                 search_blob TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -304,6 +312,20 @@ impl CatalogStore {
               CREATE INDEX IF NOT EXISTS metadata_jobs_pending_idx ON metadata_jobs(status, next_attempt_at);
               CREATE INDEX IF NOT EXISTS waveform_cache_file_idx ON waveform_cache(file_id);
               CREATE INDEX IF NOT EXISTS discography_artist_idx ON discography_items(artist_id, sort_key);",
+        )?;
+        add_column_if_missing(&connection, "tracks", "track_number", "INTEGER")?;
+        add_column_if_missing(&connection, "tracks", "date_added", "INTEGER")?;
+        add_column_if_missing(
+            &connection,
+            "tracks",
+            "play_count",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(&connection, "tracks", "first_played_at", "INTEGER")?;
+        add_column_if_missing(&connection, "tracks", "last_played_at", "INTEGER")?;
+        connection.execute(
+            "UPDATE tracks SET date_added = created_at WHERE date_added IS NULL",
+            [],
         )?;
         Ok(())
     }
@@ -453,16 +475,18 @@ impl CatalogStore {
 
         transaction.execute(
             "INSERT INTO tracks(
-                file_id, artist_id, album_id, title, artist_name, album_name, year, duration_ms,
+                file_id, artist_id, album_id, title, artist_name, album_name, track_number, year,
+                date_added, duration_ms,
                 codec, bitrate, sample_rate, channels, file_size, modified_at, artwork_asset_id,
                 artwork_path, search_blob, created_at, updated_at
-             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?20)
              ON CONFLICT(file_id) DO UPDATE SET
                 artist_id = excluded.artist_id,
                 album_id = excluded.album_id,
                 title = excluded.title,
                 artist_name = excluded.artist_name,
                 album_name = excluded.album_name,
+                track_number = excluded.track_number,
                 year = excluded.year,
                 duration_ms = excluded.duration_ms,
                 codec = excluded.codec,
@@ -482,7 +506,9 @@ impl CatalogStore {
                 &track.title,
                 &track.artist,
                 &track.album,
+                track.track_number.map(|track_number| track_number as i64),
                 track.year.as_deref(),
+                now,
                 duration_ms,
                 &track.codec,
                 track.bitrate.map(|bitrate| bitrate as i64),
@@ -497,6 +523,11 @@ impl CatalogStore {
             ],
         )?;
         let track_id = select_id_by_i64(&transaction, "tracks", "file_id", file_id)?;
+        let (date_added_ms, play_count): (i64, i64) = transaction.query_row(
+            "SELECT date_added, play_count FROM tracks WHERE id = ?1",
+            params![track_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         transaction.commit()?;
 
         Ok(CatalogTrack {
@@ -508,11 +539,14 @@ impl CatalogStore {
             title: track.title.clone(),
             artist: track.artist.clone(),
             album: track.album.clone(),
+            track_number: track.track_number,
             year: track.year.clone(),
+            date_added: millis_to_system_time(date_added_ms),
             duration: track.duration,
             codec: track.codec.clone(),
             bitrate: track.bitrate,
             file_size: size_bytes,
+            play_count: play_count.max(0) as u32,
             artwork_path,
         })
     }
@@ -680,8 +714,9 @@ impl CatalogStore {
         let mut statement = connection.prepare(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
-                tracks.artist_name, tracks.album_name, tracks.year, tracks.duration_ms, tracks.codec,
-                tracks.bitrate, tracks.file_size, tracks.artwork_path
+                tracks.artist_name, tracks.album_name, tracks.track_number, tracks.year,
+                tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
+                tracks.file_size, tracks.play_count, tracks.artwork_path
              FROM tracks
              JOIN files ON files.id = tracks.file_id
              WHERE files.status = 'present'
@@ -689,10 +724,13 @@ impl CatalogStore {
         )?;
         let rows = statement.query_map([], |row| {
             let path: String = row.get(4)?;
-            let duration_ms: i64 = row.get(9)?;
-            let bitrate: Option<i64> = row.get(11)?;
-            let file_size: i64 = row.get(12)?;
-            let artwork_path: Option<String> = row.get(13)?;
+            let track_number: Option<i64> = row.get(8)?;
+            let date_added_ms: i64 = row.get(10)?;
+            let duration_ms: i64 = row.get(11)?;
+            let bitrate: Option<i64> = row.get(13)?;
+            let file_size: i64 = row.get(14)?;
+            let play_count: i64 = row.get(15)?;
+            let artwork_path: Option<String> = row.get(16)?;
             Ok(CatalogTrack {
                 track_id: row.get(0)?,
                 file_id: row.get(1)?,
@@ -702,11 +740,14 @@ impl CatalogStore {
                 title: row.get(5)?,
                 artist: row.get(6)?,
                 album: row.get(7)?,
-                year: row.get(8)?,
+                track_number: track_number.map(|track_number| track_number as u32),
+                year: row.get(9)?,
+                date_added: millis_to_system_time(date_added_ms),
                 duration: Duration::from_millis(duration_ms.max(0) as u64),
-                codec: row.get(10)?,
+                codec: row.get(12)?,
                 bitrate: bitrate.map(|bitrate| bitrate as u32),
                 file_size: file_size.max(0) as u64,
+                play_count: play_count.max(0) as u32,
                 artwork_path: artwork_path.map(PathBuf::from),
             })
         })?;
@@ -730,8 +771,9 @@ impl CatalogStore {
         let mut statement = connection.prepare(
             "SELECT
                 tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
-                tracks.artist_name, tracks.album_name, tracks.year, tracks.duration_ms, tracks.codec,
-                tracks.bitrate, tracks.file_size, tracks.artwork_path,
+                tracks.artist_name, tracks.album_name, tracks.track_number, tracks.year,
+                tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
+                tracks.file_size, tracks.play_count, tracks.artwork_path,
                 files.size_bytes, files.modified_at, files.device_id, files.inode
              FROM tracks
              JOIN files ON files.id = tracks.file_id
@@ -739,18 +781,21 @@ impl CatalogStore {
         )?;
         let rows = statement.query_map([], |row| {
             let path: String = row.get(4)?;
-            let duration_ms: i64 = row.get(9)?;
-            let bitrate: Option<i64> = row.get(11)?;
-            let file_size: i64 = row.get(12)?;
-            let artwork_path: Option<String> = row.get(13)?;
+            let track_number: Option<i64> = row.get(8)?;
+            let date_added_ms: i64 = row.get(10)?;
+            let duration_ms: i64 = row.get(11)?;
+            let bitrate: Option<i64> = row.get(13)?;
+            let file_size: i64 = row.get(14)?;
+            let play_count: i64 = row.get(15)?;
+            let artwork_path: Option<String> = row.get(16)?;
             let path = PathBuf::from(path);
             Ok((
                 path.clone(),
                 CatalogFileFingerprint {
-                    size_bytes: row.get::<_, i64>(14)?.max(0) as u64,
-                    modified_at: row.get(15)?,
-                    device_id: row.get(16)?,
-                    inode: row.get(17)?,
+                    size_bytes: row.get::<_, i64>(17)?.max(0) as u64,
+                    modified_at: row.get(18)?,
+                    device_id: row.get(19)?,
+                    inode: row.get(20)?,
                 },
                 CatalogTrack {
                     track_id: row.get(0)?,
@@ -761,11 +806,14 @@ impl CatalogStore {
                     title: row.get(5)?,
                     artist: row.get(6)?,
                     album: row.get(7)?,
-                    year: row.get(8)?,
+                    track_number: track_number.map(|track_number| track_number as u32),
+                    year: row.get(9)?,
+                    date_added: millis_to_system_time(date_added_ms),
                     duration: Duration::from_millis(duration_ms.max(0) as u64),
-                    codec: row.get(10)?,
+                    codec: row.get(12)?,
                     bitrate: bitrate.map(|bitrate| bitrate as u32),
                     file_size: file_size.max(0) as u64,
+                    play_count: play_count.max(0) as u32,
                     artwork_path: artwork_path.map(PathBuf::from),
                 },
             ))
@@ -779,6 +827,33 @@ impl CatalogStore {
             }
         }
         Ok(tracks)
+    }
+
+    pub fn increment_play_count(&self, path: &Path) -> Result<u32> {
+        let connection = self.connect()?;
+        let now = now_millis();
+        connection.execute(
+            "UPDATE tracks
+             SET play_count = play_count + 1,
+                 first_played_at = COALESCE(first_played_at, ?1),
+                 last_played_at = ?1,
+                 updated_at = ?1
+             WHERE file_id = (SELECT id FROM files WHERE path = ?2)",
+            params![now, path.display().to_string()],
+        )?;
+
+        let play_count = connection
+            .query_row(
+                "SELECT tracks.play_count
+                 FROM tracks
+                 JOIN files ON files.id = tracks.file_id
+                 WHERE files.path = ?1",
+                params![path.display().to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        Ok(play_count.max(0) as u32)
     }
 
     pub fn mark_paths_seen(&self, scan_id: i64, paths: &[PathBuf]) -> Result<()> {
@@ -983,18 +1058,22 @@ impl CatalogStore {
             .query_row(
                 "SELECT
                     tracks.id, files.id, tracks.artist_id, tracks.album_id, files.path, tracks.title,
-                    tracks.artist_name, tracks.album_name, tracks.year, tracks.duration_ms, tracks.codec,
-                    tracks.bitrate, tracks.file_size, tracks.artwork_path
+                    tracks.artist_name, tracks.album_name, tracks.track_number, tracks.year,
+                    tracks.date_added, tracks.duration_ms, tracks.codec, tracks.bitrate,
+                    tracks.file_size, tracks.play_count, tracks.artwork_path
                  FROM tracks
                  JOIN files ON files.id = tracks.file_id
                  WHERE files.path = ?1 AND files.status = 'present'",
                 params![path.display().to_string()],
                 |row| {
                     let path: String = row.get(4)?;
-                    let duration_ms: i64 = row.get(9)?;
-                    let bitrate: Option<i64> = row.get(11)?;
-                    let file_size: i64 = row.get(12)?;
-                    let artwork_path: Option<String> = row.get(13)?;
+                    let track_number: Option<i64> = row.get(8)?;
+                    let date_added_ms: i64 = row.get(10)?;
+                    let duration_ms: i64 = row.get(11)?;
+                    let bitrate: Option<i64> = row.get(13)?;
+                    let file_size: i64 = row.get(14)?;
+                    let play_count: i64 = row.get(15)?;
+                    let artwork_path: Option<String> = row.get(16)?;
                     Ok(CatalogTrack {
                         track_id: row.get(0)?,
                         file_id: row.get(1)?,
@@ -1004,11 +1083,14 @@ impl CatalogStore {
                         title: row.get(5)?,
                         artist: row.get(6)?,
                         album: row.get(7)?,
-                        year: row.get(8)?,
+                        track_number: track_number.map(|track_number| track_number as u32),
+                        year: row.get(9)?,
+                        date_added: millis_to_system_time(date_added_ms),
                         duration: Duration::from_millis(duration_ms.max(0) as u64),
-                        codec: row.get(10)?,
+                        codec: row.get(12)?,
                         bitrate: bitrate.map(|bitrate| bitrate as u32),
                         file_size: file_size.max(0) as u64,
+                        play_count: play_count.max(0) as u32,
                         artwork_path: artwork_path.map(PathBuf::from),
                     })
                 },
@@ -1389,6 +1471,27 @@ fn select_id_by_i64(connection: &Connection, table: &str, column: &str, value: i
         .with_context(|| format!("failed to select id from {table}"))
 }
 
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = connection.prepare(&pragma)?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let existing: String = row.get(1)?;
+        if existing == column {
+            return Ok(());
+        }
+    }
+
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    connection.execute(&sql, [])?;
+    Ok(())
+}
+
 fn normalize_key(value: &str) -> String {
     value
         .split_whitespace()
@@ -1494,6 +1597,10 @@ fn now_millis() -> i64 {
 fn system_time_to_millis(time: SystemTime) -> Option<i64> {
     let millis = time.duration_since(UNIX_EPOCH).ok()?.as_millis();
     Some(millis.min(i64::MAX as u128) as i64)
+}
+
+fn millis_to_system_time(millis: i64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(millis.max(0) as u64)
 }
 
 fn data_home() -> PathBuf {
@@ -1704,7 +1811,9 @@ mod tests {
                     title: "One".to_string(),
                     artist: "Alice".to_string(),
                     album: "First".to_string(),
+                    track_number: None,
                     year: Some("2024".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1724,7 +1833,9 @@ mod tests {
                     title: "Two".to_string(),
                     artist: "Alice".to_string(),
                     album: "First".to_string(),
+                    track_number: None,
                     year: Some("2024".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1744,7 +1855,9 @@ mod tests {
                     title: "Three".to_string(),
                     artist: "Bob".to_string(),
                     album: "Outside".to_string(),
+                    track_number: None,
                     year: None,
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1792,7 +1905,9 @@ mod tests {
                     title: "One".to_string(),
                     artist: "Alice".to_string(),
                     album: "First".to_string(),
+                    track_number: None,
                     year: Some("2024".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1837,7 +1952,9 @@ mod tests {
                     title: "One".to_string(),
                     artist: "Alice".to_string(),
                     album: "First".to_string(),
+                    track_number: None,
                     year: Some("2024".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1876,7 +1993,9 @@ mod tests {
                     title: "Solo".to_string(),
                     artist: "A$AP Rocky".to_string(),
                     album: "Testing".to_string(),
+                    track_number: None,
                     year: Some("2018".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,
@@ -1896,7 +2015,9 @@ mod tests {
                     title: "Featured".to_string(),
                     artist: "A$AP Rocky feat/ Skepta".to_string(),
                     album: "Testing".to_string(),
+                    track_number: None,
                     year: Some("2018".to_string()),
+                    date_added: UNIX_EPOCH,
                     duration: Duration::from_secs(60),
                     codec: "FLAC".to_string(),
                     sample_rate: None,

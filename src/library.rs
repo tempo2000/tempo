@@ -41,6 +41,7 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub track_number: Option<u32>,
     pub year: Option<String>,
     pub duration: Duration,
     pub codec: String,
@@ -48,6 +49,7 @@ pub struct Track {
     pub channels: Option<u8>,
     pub bitrate: Option<u32>,
     pub file_size: u64,
+    pub date_added: SystemTime,
     pub modified: Option<SystemTime>,
     pub artwork: Option<Artwork>,
 }
@@ -423,6 +425,7 @@ pub fn index_audio_file(path: impl AsRef<Path>) -> Result<Track> {
             .map(|album| album.trim().to_string())
             .filter(|album| !album.is_empty())
             .unwrap_or_else(|| "Unknown Album".to_string()),
+        track_number: tag.and_then(|tag| tag.track()),
         year,
         duration: properties.duration(),
         codec: codec_label(path),
@@ -432,6 +435,7 @@ pub fn index_audio_file(path: impl AsRef<Path>) -> Result<Track> {
             .audio_bitrate()
             .or_else(|| properties.overall_bitrate()),
         file_size: metadata.len(),
+        date_added: SystemTime::now(),
         modified: metadata.modified().ok(),
         artwork,
     })
@@ -443,7 +447,9 @@ fn track_from_catalog(track: CatalogTrack) -> Track {
         title: track.title,
         artist: track.artist,
         album: track.album,
+        track_number: track.track_number,
         year: track.year,
+        date_added: track.date_added,
         duration: track.duration,
         codec: track.codec,
         sample_rate: None,
