@@ -9,15 +9,16 @@ use std::{
 use gpui::{
     AnyElement, App, Application, Bounds, ClickEvent, Context, CursorStyle, FocusHandle, Image,
     ImageFormat, IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Render,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Render,
     ScrollStrategy, SharedString, Styled, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions, actions, div, img, prelude::*, px, rgb, size, uniform_list,
+    WindowOptions, actions, div, img, point, prelude::*, px, rgb, size, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
 use tempo::{
     library::{
-        Artwork as LibraryArtwork, LibraryEvent, LibraryIndexer, LibraryWatcher, ScanProgress,
+        Artwork as LibraryArtwork, IndexingError, LibraryEvent, LibraryIndexer, LibraryWatcher,
+        ScanProgress,
     },
     playback::PlaybackController,
 };
@@ -117,6 +118,8 @@ struct Track {
     plays: String,
     loved: bool,
     artwork: Option<TrackArtwork>,
+    album_initials: String,
+    album_color: u32,
 }
 
 #[derive(Clone)]
@@ -148,6 +151,68 @@ enum TrackArtwork {
     File(PathBuf),
 }
 
+#[derive(Clone)]
+struct TrackDrag {
+    track_ix: usize,
+    title: SharedString,
+    artist: SharedString,
+    position: gpui::Point<Pixels>,
+}
+
+impl TrackDrag {
+    fn new(track_ix: usize, track: &Track) -> Self {
+        Self {
+            track_ix,
+            title: track.title.clone().into(),
+            artist: track.artist.clone().into(),
+            position: gpui::Point::default(),
+        }
+    }
+
+    fn position(mut self, position: gpui::Point<Pixels>) -> Self {
+        self.position = position;
+        self
+    }
+}
+
+impl Render for TrackDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(18.0))
+            .pt(self.position.y - px(18.0))
+            .child(
+                div()
+                    .w(px(220.0))
+                    .h(px(42.0))
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x4b4f5a))
+                    .bg(rgb(0x202229))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0xf0f0f4))
+                            .child(self.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(rgb(0x9a9ea8))
+                            .child(self.artist.clone()),
+                    ),
+            )
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Playlist {
     name: String,
@@ -167,6 +232,29 @@ struct BrowseTab {
     sort_direction: SortDirection,
     selected_track: usize,
     table_scroll_handle: UniformListScrollHandle,
+    track_indices: Vec<usize>,
+    scrollbar_markers: Vec<ScrollbarMarker>,
+}
+
+#[derive(Clone)]
+struct ScrollbarMarker {
+    ratio: f32,
+    label: String,
+}
+
+#[derive(Clone, Copy)]
+struct TableScrollbarDrag {
+    thumb_offset: f32,
+}
+
+#[derive(Clone, Copy)]
+struct TableScrollbarMetrics {
+    track_top: f32,
+    track_height: f32,
+    thumb_top: f32,
+    thumb_height: f32,
+    max_scroll: f32,
+    scroll_top: f32,
 }
 
 impl BrowseTab {
@@ -178,6 +266,8 @@ impl BrowseTab {
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
             table_scroll_handle: UniformListScrollHandle::new(),
+            track_indices: Vec::new(),
+            scrollbar_markers: Vec::new(),
         }
     }
 
@@ -189,6 +279,8 @@ impl BrowseTab {
             sort_direction: SortDirection::Ascending,
             selected_track: 0,
             table_scroll_handle: UniformListScrollHandle::new(),
+            track_indices: Vec::new(),
+            scrollbar_markers: Vec::new(),
         }
     }
 }
@@ -207,14 +299,21 @@ const FMT_COL_W: f32 = 70.0;
 const PLAYS_COL_W: f32 = 82.0;
 const TIME_COL_W: f32 = 64.0;
 const LOVE_COL_W: f32 = 24.0;
+const TABLE_ROW_H: f32 = 32.0;
 const LEFT_SIDEBAR_W: f32 = 220.0;
 const RIGHT_SIDEBAR_W: f32 = 300.0;
-const WAVEFORM_SEGMENTS: usize = 240;
+const WAVEFORM_SEGMENTS: usize = 360;
 const PLAYER_BAR_PAD: f32 = 16.0;
 const PLAYER_ART_W: f32 = 54.0;
 const PLAYER_INFO_W: f32 = 220.0;
 const PLAYER_CONTROLS_W: f32 = 170.0;
 const PLAYER_GAP: f32 = 16.0;
+const TABLE_SCROLLBAR_W: f32 = 54.0;
+const TABLE_SCROLLBAR_TRACK_W: f32 = 6.0;
+const TABLE_SCROLLBAR_MARGIN: f32 = 4.0;
+const TABLE_SCROLLBAR_MIN_THUMB_H: f32 = 32.0;
+const TABLE_SCROLLBAR_MAX_MARKERS: usize = 28;
+const FAST_SCROLL_OVERSCAN_ROWS: usize = 4;
 
 struct TempoApp {
     focus_handle: FocusHandle,
@@ -240,7 +339,10 @@ struct TempoApp {
     library_status: String,
     playback_status: String,
     scan_progress: ScanProgress,
+    scan_errors: Vec<IndexingError>,
+    show_scan_errors: bool,
     is_scanning: bool,
+    table_scrollbar_drag: Option<TableScrollbarDrag>,
     _library_watcher: Option<LibraryWatcher>,
     playback: Option<PlaybackController>,
 }
@@ -291,7 +393,10 @@ impl TempoApp {
             library_status,
             playback_status,
             scan_progress: ScanProgress::default(),
+            scan_errors: Vec::new(),
+            show_scan_errors: false,
             is_scanning: false,
+            table_scrollbar_drag: None,
             _library_watcher: library_watcher,
             playback,
         };
@@ -454,7 +559,23 @@ impl TempoApp {
             name,
             track_paths: Vec::new(),
         });
+        self.invalidate_track_indices();
         self.save_app_state();
+    }
+
+    fn add_track_to_playlist(&mut self, track_ix: usize, playlist_ix: usize) {
+        let Some(track_path) = self.tracks.get(track_ix).map(|track| track.path.clone()) else {
+            return;
+        };
+
+        let Some(playlist) = self.playlists.get_mut(playlist_ix) else {
+            return;
+        };
+
+        playlist.track_paths.push(track_path);
+        self.invalidate_track_indices();
+        self.save_app_state();
+        self.context_menu_track = None;
     }
 
     fn next_playlist_name(&self) -> String {
@@ -521,6 +642,7 @@ impl TempoApp {
     fn new_library_tab(&mut self) {
         self.tabs.push(BrowseTab::library());
         self.active_tab = self.tabs.len() - 1;
+        self.rebuild_track_indices_for_tab(self.active_tab);
         self.page = Page::Library;
         self.context_menu_track = None;
     }
@@ -535,6 +657,7 @@ impl TempoApp {
         } else {
             self.tabs.push(BrowseTab::library());
             self.active_tab = self.tabs.len() - 1;
+            self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
         self.open_page(Page::Library);
@@ -554,6 +677,7 @@ impl TempoApp {
         } else {
             self.tabs.push(BrowseTab::playlist(playlist_ix));
             self.active_tab = self.tabs.len() - 1;
+            self.rebuild_track_indices_for_tab(self.active_tab);
         }
 
         self.open_page(Page::Library);
@@ -639,6 +763,9 @@ impl TempoApp {
 
 impl From<tempo::library::Track> for Track {
     fn from(track: tempo::library::Track) -> Self {
+        let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
+        let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+
         Self {
             path: track.path,
             title: track.title,
@@ -653,6 +780,8 @@ impl From<tempo::library::Track> for Track {
             plays: "0".to_string(),
             loved: false,
             artwork: track.artwork.and_then(TrackArtwork::from_library),
+            album_initials,
+            album_color,
         }
     }
 }
@@ -692,7 +821,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 impl Render for TempoApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("tempo-app")
             .track_focus(&self.focus_handle)
@@ -717,7 +846,7 @@ impl Render for TempoApp {
                     .child(self.render_left_sidebar(cx))
                     .child(self.render_content(cx)),
             )
-            .child(self.render_player_bar(cx))
+            .child(self.render_player_bar(window, cx))
     }
 }
 
@@ -738,6 +867,8 @@ impl TempoApp {
                 self.is_playing = false;
                 self.context_menu_track = None;
                 self.scan_progress = ScanProgress::default();
+                self.scan_errors.clear();
+                self.show_scan_errors = false;
                 self.is_scanning = true;
                 self.library_status = format!("Scanning {}", self.library_root_label);
             }
@@ -792,6 +923,7 @@ impl TempoApp {
             LibraryEvent::ScanError(error) => {
                 self.scan_progress.errors += 1;
                 self.library_status = format!("Scan warning: {}", error.message);
+                self.scan_errors.push(error);
             }
             LibraryEvent::ScanFinished => {
                 self.clamp_track_indices();
@@ -802,6 +934,16 @@ impl TempoApp {
     }
 
     fn scan_status(progress: ScanProgress, is_scanning: bool) -> String {
+        let mut status = Self::scan_status_summary(progress, is_scanning);
+
+        if progress.errors > 0 {
+            status.push_str(&format!(", {} errors", progress.errors));
+        }
+
+        status
+    }
+
+    fn scan_status_summary(progress: ScanProgress, is_scanning: bool) -> String {
         let prefix = if is_scanning {
             "Scanning"
         } else {
@@ -812,29 +954,43 @@ impl TempoApp {
             return format!("{prefix}: looking for audio files...");
         }
 
-        let mut status = format!(
+        let status = format!(
             "{prefix}: {} discovered, {} indexed",
             progress.discovered, progress.indexed
         );
-
-        if progress.errors > 0 {
-            status.push_str(&format!(", {} errors", progress.errors));
-        }
-
         status
     }
 
     fn visible_scan_status(&self) -> String {
+        self.visible_scan_status_with(self.library_status.clone())
+    }
+
+    fn visible_scan_status_without_errors(&self) -> String {
+        if self.scan_progress.errors == 0 {
+            return self.visible_scan_status();
+        }
+
+        let error_suffix = format!(", {} errors", self.scan_progress.errors);
+        let library_status = self
+            .library_status
+            .strip_suffix(&error_suffix)
+            .unwrap_or(&self.library_status)
+            .to_string();
+
+        self.visible_scan_status_with(library_status)
+    }
+
+    fn visible_scan_status_with(&self, library_status: String) -> String {
         let total = self.active_source_track_count();
         if self.active_search_query().trim().is_empty() {
-            return format!("{} items  ·  {}", total, self.library_status);
+            return format!("{} items  ·  {}", total, library_status);
         }
 
         format!(
             "{} of {} items  ·  {}",
             self.filtered_track_count(),
             total,
-            self.library_status
+            library_status
         )
     }
 
@@ -843,23 +999,55 @@ impl TempoApp {
     }
 
     fn active_source_track_count(&self) -> usize {
-        self.source_track_indices(self.active_tab().source).len()
+        self.source_track_count(self.active_tab().source)
     }
 
-    fn invalidate_track_indices(&mut self) {}
+    fn invalidate_track_indices(&mut self) {
+        for tab_ix in 0..self.tabs.len() {
+            self.rebuild_track_indices_for_tab(tab_ix);
+        }
+    }
 
-    fn current_track_indices(&self) -> Vec<usize> {
+    fn current_track_indices(&self) -> &[usize] {
         self.track_indices_for_tab(self.active_tab)
     }
 
-    fn track_indices_for_tab(&self, tab_ix: usize) -> Vec<usize> {
+    fn track_indices_for_tab(&self, tab_ix: usize) -> &[usize] {
+        self.tabs
+            .get(tab_ix)
+            .map(|tab| tab.track_indices.as_slice())
+            .unwrap_or_default()
+    }
+
+    fn rebuild_track_indices_for_tab(&mut self, tab_ix: usize) {
         let Some(tab) = self.tabs.get(tab_ix) else {
-            return Vec::new();
+            return;
         };
 
-        let terms = Self::search_terms(&tab.search_query);
+        let source = tab.source;
+        let search_query = tab.search_query.clone();
+        let sort_column = tab.sort_column;
+        let sort_direction = tab.sort_direction;
+
+        let indices =
+            self.compute_track_indices(source, &search_query, sort_column, sort_direction);
+        let scrollbar_markers = self.compute_scrollbar_markers(&indices, sort_column);
+        if let Some(tab) = self.tabs.get_mut(tab_ix) {
+            tab.track_indices = indices;
+            tab.scrollbar_markers = scrollbar_markers;
+        }
+    }
+
+    fn compute_track_indices(
+        &self,
+        source: TabSource,
+        search_query: &str,
+        sort_column: SortColumn,
+        sort_direction: SortDirection,
+    ) -> Vec<usize> {
+        let terms = Self::search_terms(search_query);
         let mut indices = self
-            .source_track_indices(tab.source)
+            .source_track_indices(source)
             .into_iter()
             .filter(|track_ix| {
                 self.tracks
@@ -868,8 +1056,8 @@ impl TempoApp {
             })
             .collect::<Vec<_>>();
 
-        if tab.sort_column == SortColumn::Index {
-            if tab.sort_direction == SortDirection::Descending {
+        if sort_column == SortColumn::Index {
+            if sort_direction == SortDirection::Descending {
                 indices.reverse();
             }
             return indices;
@@ -878,7 +1066,7 @@ impl TempoApp {
         indices.sort_by(|a, b| {
             let left = &self.tracks[*a];
             let right = &self.tracks[*b];
-            let ordering = match tab.sort_column {
+            let ordering = match sort_column {
                 SortColumn::Index => a.cmp(b),
                 SortColumn::Title => left.title.cmp(&right.title),
                 SortColumn::Album => left
@@ -897,13 +1085,123 @@ impl TempoApp {
                 SortColumn::Duration => left.duration_value.cmp(&right.duration_value),
             };
 
-            match tab.sort_direction {
+            match sort_direction {
                 SortDirection::Ascending => ordering,
                 SortDirection::Descending => ordering.reverse(),
             }
         });
 
         indices
+    }
+
+    fn compute_scrollbar_markers(
+        &self,
+        indices: &[usize],
+        sort_column: SortColumn,
+    ) -> Vec<ScrollbarMarker> {
+        if indices.len() <= 1 {
+            return Vec::new();
+        }
+
+        match sort_column {
+            SortColumn::Title | SortColumn::Album | SortColumn::Format => {
+                self.compute_grouped_scrollbar_markers(indices, sort_column)
+            }
+            SortColumn::Index | SortColumn::Plays | SortColumn::Duration => {
+                self.compute_sampled_scrollbar_markers(indices, sort_column)
+            }
+        }
+    }
+
+    fn compute_grouped_scrollbar_markers(
+        &self,
+        indices: &[usize],
+        sort_column: SortColumn,
+    ) -> Vec<ScrollbarMarker> {
+        let denominator = indices.len().saturating_sub(1) as f32;
+        let mut markers = Vec::new();
+        let mut previous_label = String::new();
+
+        for (row_ix, track_ix) in indices.iter().copied().enumerate() {
+            let Some(track) = self.tracks.get(track_ix) else {
+                continue;
+            };
+            let label = match sort_column {
+                SortColumn::Title => Self::marker_initial(&track.title),
+                SortColumn::Album => Self::marker_initial(&track.album),
+                SortColumn::Format => track.codec.to_ascii_uppercase(),
+                SortColumn::Index | SortColumn::Plays | SortColumn::Duration => unreachable!(),
+            };
+
+            if label == previous_label {
+                continue;
+            }
+
+            previous_label = label.clone();
+            markers.push(ScrollbarMarker {
+                ratio: row_ix as f32 / denominator,
+                label,
+            });
+
+            if markers.len() >= TABLE_SCROLLBAR_MAX_MARKERS {
+                break;
+            }
+        }
+
+        markers
+    }
+
+    fn compute_sampled_scrollbar_markers(
+        &self,
+        indices: &[usize],
+        sort_column: SortColumn,
+    ) -> Vec<ScrollbarMarker> {
+        let samples = [0.0_f32, 0.25, 0.5, 0.75, 1.0];
+        let last_row = indices.len().saturating_sub(1);
+        let mut markers = Vec::new();
+
+        for ratio in samples {
+            let row_ix = (ratio * last_row as f32).round() as usize;
+            let Some(track_ix) = indices.get(row_ix).copied() else {
+                continue;
+            };
+            let label = self.scrollbar_marker_label(track_ix, sort_column);
+            if markers
+                .iter()
+                .any(|marker: &ScrollbarMarker| marker.label == label)
+            {
+                continue;
+            }
+
+            markers.push(ScrollbarMarker { ratio, label });
+        }
+
+        markers
+    }
+
+    fn marker_initial(value: &str) -> String {
+        value
+            .trim_start()
+            .chars()
+            .find(|ch| ch.is_alphanumeric())
+            .map(|ch| ch.to_uppercase().collect::<String>())
+            .filter(|label| !label.is_empty())
+            .unwrap_or_else(|| "#".to_string())
+    }
+
+    fn scrollbar_marker_label(&self, track_ix: usize, sort_column: SortColumn) -> String {
+        let Some(track) = self.tracks.get(track_ix) else {
+            return String::new();
+        };
+
+        match sort_column {
+            SortColumn::Index => format!("{}", track_ix + 1),
+            SortColumn::Title => Self::marker_initial(&track.title),
+            SortColumn::Album => Self::marker_initial(&track.album),
+            SortColumn::Format => track.codec.to_ascii_uppercase(),
+            SortColumn::Plays => track.plays.clone(),
+            SortColumn::Duration => track.duration.clone(),
+        }
     }
 
     fn source_track_indices(&self, source: TabSource) -> Vec<usize> {
@@ -923,18 +1221,28 @@ impl TempoApp {
         }
     }
 
+    fn source_track_count(&self, source: TabSource) -> usize {
+        match source {
+            TabSource::Library => self.tracks.len(),
+            TabSource::Playlist(_) => self.source_track_indices(source).len(),
+        }
+    }
+
     fn set_search_query(&mut self, query: String) {
         self.active_tab_mut().search_query = query;
         self.context_menu_track = None;
         self.invalidate_track_indices();
-        let indices = self.current_track_indices();
         let selected_track = self.active_selected_track();
-        if let Some(first_track_ix) = indices.first() {
-            if !indices.contains(&selected_track) {
-                self.set_active_selected_track(*first_track_ix);
+        let replacement_track = {
+            let indices = self.current_track_indices();
+            if let Some(first_track_ix) = indices.first() {
+                (!indices.contains(&selected_track)).then_some(*first_track_ix)
+            } else {
+                Some(0)
             }
-        } else {
-            self.set_active_selected_track(0);
+        };
+        if let Some(track_ix) = replacement_track {
+            self.set_active_selected_track(track_ix);
         }
         self.active_tab()
             .table_scroll_handle
@@ -1151,12 +1459,13 @@ impl TempoApp {
         self.playing_track = self.playing_track.min(last);
 
         for tab_ix in 0..self.tabs.len() {
-            let indices = self.track_indices_for_tab(tab_ix);
+            let selected_track = self.tabs[tab_ix].selected_track.min(last);
+            let replacement_track = {
+                let indices = self.track_indices_for_tab(tab_ix);
+                (!indices.contains(&selected_track)).then(|| indices.first().copied().unwrap_or(0))
+            };
             let tab = &mut self.tabs[tab_ix];
-            tab.selected_track = tab.selected_track.min(last);
-            if !indices.contains(&tab.selected_track) {
-                tab.selected_track = indices.first().copied().unwrap_or(0);
-            }
+            tab.selected_track = replacement_track.unwrap_or(selected_track);
         }
 
         if self
@@ -1352,11 +1661,164 @@ impl TempoApp {
             return;
         };
         let next = (position as isize + delta).clamp(0, indices.len().saturating_sub(1) as isize);
-        self.set_active_selected_track(indices[next as usize]);
+        let next_track = indices[next as usize];
+        self.set_active_selected_track(next_track);
         self.active_tab()
             .table_scroll_handle
             .scroll_to_item(next as usize, ScrollStrategy::Center);
         self.context_menu_track = None;
+    }
+
+    fn table_scrollbar_metrics(&self) -> Option<TableScrollbarMetrics> {
+        let handle = self.active_tab().table_scroll_handle.clone();
+        let (base_handle, measured) = {
+            let state = handle.0.borrow();
+            (state.base_handle.clone(), state.last_item_size.is_some())
+        };
+
+        if !measured {
+            return None;
+        }
+
+        let bounds = base_handle.bounds();
+        let viewport_height = f32::from(bounds.size.height);
+        if viewport_height <= 0.0 {
+            return None;
+        }
+
+        let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
+        let content_height = viewport_height + max_scroll;
+        let track_height = (viewport_height - TABLE_SCROLLBAR_MARGIN * 2.0).max(1.0);
+        let thumb_height = if content_height <= 0.0 {
+            track_height
+        } else {
+            ((viewport_height / content_height) * track_height)
+                .max(TABLE_SCROLLBAR_MIN_THUMB_H)
+                .min(track_height)
+        };
+        let thumb_travel = (track_height - thumb_height).max(0.0);
+        let scroll_top = (-f32::from(base_handle.offset().y)).clamp(0.0, max_scroll);
+        let thumb_top = if max_scroll > 0.0 && thumb_travel > 0.0 {
+            (scroll_top / max_scroll) * thumb_travel
+        } else {
+            0.0
+        };
+
+        Some(TableScrollbarMetrics {
+            track_top: f32::from(bounds.origin.y) + TABLE_SCROLLBAR_MARGIN,
+            track_height,
+            thumb_top,
+            thumb_height,
+            max_scroll,
+            scroll_top,
+        })
+    }
+
+    fn begin_table_scrollbar_drag(&mut self, event: &MouseDownEvent) -> bool {
+        let Some(metrics) = self.table_scrollbar_metrics() else {
+            return false;
+        };
+
+        if metrics.max_scroll <= 0.0 {
+            return false;
+        }
+
+        let local_y = f32::from(event.position.y) - metrics.track_top;
+        let thumb_bottom = metrics.thumb_top + metrics.thumb_height;
+        let thumb_offset = if (metrics.thumb_top..=thumb_bottom).contains(&local_y) {
+            local_y - metrics.thumb_top
+        } else {
+            metrics.thumb_height / 2.0
+        };
+
+        self.table_scrollbar_drag = Some(TableScrollbarDrag { thumb_offset });
+        self.scroll_table_to_scrollbar_y(event.position.y, thumb_offset);
+        true
+    }
+
+    fn drag_table_scrollbar(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.table_scrollbar_drag else {
+            return false;
+        };
+
+        if !event.dragging() {
+            self.table_scrollbar_drag = None;
+            return false;
+        }
+
+        self.scroll_table_to_scrollbar_y(event.position.y, drag.thumb_offset)
+    }
+
+    fn finish_table_scrollbar_drag(&mut self) -> bool {
+        self.table_scrollbar_drag.take().is_some()
+    }
+
+    fn finish_table_drag_interactions(&mut self) -> bool {
+        let scrolled = self.finish_table_scrollbar_drag();
+        let resized = self.finish_column_resize();
+        scrolled || resized
+    }
+
+    fn scroll_table_to_scrollbar_y(&mut self, mouse_y: Pixels, thumb_offset: f32) -> bool {
+        let Some(metrics) = self.table_scrollbar_metrics() else {
+            return false;
+        };
+
+        if metrics.max_scroll <= 0.0 {
+            return false;
+        }
+
+        let thumb_travel = (metrics.track_height - metrics.thumb_height).max(1.0);
+        let thumb_top =
+            (f32::from(mouse_y) - metrics.track_top - thumb_offset).clamp(0.0, thumb_travel);
+        let ratio = thumb_top / thumb_travel;
+        self.scroll_table_to_ratio(ratio)
+    }
+
+    fn scroll_table_to_ratio(&mut self, ratio: f32) -> bool {
+        let handle = self.active_tab().table_scroll_handle.clone();
+        let base_handle = handle.0.borrow().base_handle.clone();
+        let max_scroll = f32::from(base_handle.max_offset().height).max(0.0);
+        if max_scroll <= 0.0 {
+            return false;
+        }
+
+        let target_y = px(-(ratio.clamp(0.0, 1.0) * max_scroll));
+        let current = base_handle.offset();
+        if (f32::from(current.y) - f32::from(target_y)).abs() < 0.5 {
+            return false;
+        }
+
+        base_handle.set_offset(point(current.x, target_y));
+        true
+    }
+
+    fn current_scrollbar_label(&self, metrics: TableScrollbarMetrics) -> Option<String> {
+        let indices = self.current_track_indices();
+        if indices.is_empty() {
+            return None;
+        }
+
+        let ratio = if metrics.max_scroll > 0.0 {
+            metrics.scroll_top / metrics.max_scroll
+        } else {
+            0.0
+        };
+        let row_ix =
+            (ratio.clamp(0.0, 1.0) * indices.len().saturating_sub(1) as f32).round() as usize;
+        let track_ix = *indices.get(row_ix)?;
+        Some(self.scrollbar_marker_label(track_ix, self.active_tab().sort_column))
+    }
+
+    fn fast_scroll_top_row(&self) -> (usize, f32) {
+        let Some(metrics) = self.table_scrollbar_metrics() else {
+            return (0, 0.0);
+        };
+
+        let scroll_top = metrics.scroll_top.max(0.0);
+        let row = (scroll_top / TABLE_ROW_H).floor() as usize;
+        let offset = -(scroll_top % TABLE_ROW_H);
+        (row, offset)
     }
 
     fn render_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1572,6 +2034,10 @@ impl TempoApp {
                 this.open_playlist_tab(ix);
                 cx.notify();
             }))
+            .on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
+                this.add_track_to_playlist(drag.track_ix, ix);
+                cx.notify();
+            }))
     }
 
     fn render_nav_item(
@@ -1621,10 +2087,17 @@ impl TempoApp {
             .min_w_0()
             .flex()
             .flex_col()
+            .relative()
             .bg(rgb(0x131419))
             .child(self.render_library_header(cx))
-            .child(self.render_tab_bar(cx))
+            .when(self.tabs.len() > 1, |this| {
+                this.child(self.render_tab_bar(cx))
+            })
             .child(self.render_table(cx))
+            .when(
+                self.show_scan_errors && !self.scan_errors.is_empty(),
+                |this| this.child(self.render_scan_errors_popover(cx)),
+            )
     }
 
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1726,6 +2199,18 @@ impl TempoApp {
                         })),
                 )
             })
+            .when_some(
+                match tab.source {
+                    TabSource::Playlist(playlist_ix) => Some(playlist_ix),
+                    TabSource::Library => None,
+                },
+                |this, playlist_ix| {
+                    this.on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
+                        this.add_track_to_playlist(drag.track_ix, playlist_ix);
+                        cx.notify();
+                    }))
+                },
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.active_tab = ix;
                 this.open_page(Page::Library);
@@ -1763,12 +2248,7 @@ impl TempoApp {
                             .child(self.tab_title(self.active_tab())),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(if self.is_scanning { 0xeeb17d } else { 0x676b74 }))
-                    .child(self.visible_scan_status()),
-            )
+            .child(self.render_scan_status(cx))
             .child(div().flex_1())
             .child(
                 div()
@@ -1822,9 +2302,126 @@ impl TempoApp {
             )
     }
 
+    fn render_scan_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .text_xs()
+            .text_color(rgb(if self.is_scanning { 0xeeb17d } else { 0x676b74 }))
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(self.visible_scan_status_without_errors())
+            .when(self.scan_progress.errors > 0, |this| {
+                let label = format!(
+                    "{} {}",
+                    self.scan_progress.errors,
+                    if self.scan_progress.errors == 1 {
+                        "error"
+                    } else {
+                        "errors"
+                    }
+                );
+
+                this.child(
+                    div()
+                        .id("scan-errors-toggle")
+                        .rounded_sm()
+                        .px_1()
+                        .cursor_pointer()
+                        .text_color(rgb(0xeeb17d))
+                        .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf2c693)))
+                        .child(label)
+                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.show_scan_errors = !this.show_scan_errors;
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+            })
+    }
+
+    fn render_scan_errors_popover(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let errors = self
+            .scan_errors
+            .iter()
+            .rev()
+            .take(10)
+            .map(|error| {
+                div()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(0x282a30))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(0xf0f0f4))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(error.path.display().to_string()),
+                    )
+                    .child(div().text_color(rgb(0xa1a5af)).child(error.message.clone()))
+            })
+            .collect::<Vec<_>>();
+        let hidden_count = self.scan_errors.len().saturating_sub(errors.len());
+
+        div()
+            .absolute()
+            .top(px(46.0))
+            .right(px(16.0))
+            .w(px(420.0))
+            .max_h(px(360.0))
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x343741))
+            .bg(rgb(0x1b1c22))
+            .shadow_lg()
+            .p_3()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0xf0f0f4))
+                            .child("Scan errors"),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Self::sidebar_button("x", "close-scan-errors").on_click(cx.listener(
+                            |this, _event: &ClickEvent, _window, cx| {
+                                this.show_scan_errors = false;
+                                cx.stop_propagation();
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x8a8e97))
+                    .child("Most recent errors are shown first."),
+            )
+            .children(errors)
+            .when(hidden_count > 0, |this| {
+                this.child(
+                    div()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(rgb(0x8a8e97))
+                        .child(format!("+{hidden_count} older errors")),
+                )
+            })
+    }
+
     fn render_table(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let indices = self.current_track_indices();
-        let item_count = indices.len();
+        let item_count = self.current_track_indices().len();
         let active_search_query = self.active_search_query().to_string();
         let has_no_search_results = item_count == 0
             && self.active_source_track_count() > 0
@@ -1839,7 +2436,9 @@ impl TempoApp {
             .relative()
             .overflow_hidden()
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if this.resize_column_from_mouse(event) {
+                let scrolled = this.drag_table_scrollbar(event);
+                let resized = !scrolled && this.resize_column_from_mouse(event);
+                if scrolled || resized {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1847,7 +2446,16 @@ impl TempoApp {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
-                    if this.finish_column_resize() {
+                    if this.finish_table_drag_interactions() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_table_drag_interactions() {
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -1855,29 +2463,44 @@ impl TempoApp {
             )
             .child(self.render_table_header(cx))
             .child(
-                div().flex_1().min_h_0().relative().child(
-                    uniform_list(
-                        "track-table-rows",
-                        item_count,
-                        cx.processor(move |this, range: Range<usize>, _window, cx| {
-                            range
-                                .clone()
-                                .enumerate()
-                                .filter_map(|(visible_row_ix, row_ix)| {
-                                    let track_ix = *indices.get(row_ix)?;
-                                    Some(this.render_track_row(
-                                        visible_row_ix,
-                                        track_ix,
-                                        &this.tracks[track_ix],
-                                        cx,
-                                    ))
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .size_full()
-                    .track_scroll(table_scroll_handle),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .when(self.table_scrollbar_drag.is_some(), |this| {
+                        this.child(self.render_fast_scroll_rows())
+                    })
+                    .when(self.table_scrollbar_drag.is_none(), |this| {
+                        this.child(
+                            uniform_list(
+                                "track-table-rows",
+                                item_count,
+                                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                    let row_track_indices = range
+                                        .filter_map(|row_ix| {
+                                            this.current_track_indices().get(row_ix).copied()
+                                        })
+                                        .collect::<Vec<_>>();
+
+                                    row_track_indices
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(visible_row_ix, track_ix)| {
+                                            this.render_track_row(
+                                                visible_row_ix,
+                                                track_ix,
+                                                &this.tracks[track_ix],
+                                                cx,
+                                            )
+                                        })
+                                        .collect()
+                                }),
+                            )
+                            .size_full()
+                            .track_scroll(table_scroll_handle),
+                        )
+                    })
+                    .child(self.render_table_scrollbar(item_count, cx)),
             )
             .when(self.tracks.is_empty(), |this| {
                 this.child(
@@ -1940,6 +2563,275 @@ impl TempoApp {
                     .filter(|track_ix| *track_ix < self.tracks.len()),
                 |this, track_ix| this.child(self.render_context_menu(track_ix, cx)),
             )
+    }
+
+    fn render_fast_scroll_rows(&self) -> AnyElement {
+        let Some(metrics) = self.table_scrollbar_metrics() else {
+            return div().size_full().into_any_element();
+        };
+
+        let indices = self.current_track_indices();
+        if indices.is_empty() {
+            return div().size_full().into_any_element();
+        }
+
+        let viewport_height = metrics.track_height + TABLE_SCROLLBAR_MARGIN * 2.0;
+        let visible_rows = (viewport_height / TABLE_ROW_H).ceil() as usize + 2;
+        let (top_row, row_offset) = self.fast_scroll_top_row();
+        let start_row = top_row.saturating_sub(FAST_SCROLL_OVERSCAN_ROWS);
+        let rows_to_render = visible_rows + FAST_SCROLL_OVERSCAN_ROWS * 2;
+        let first_row_top = row_offset - ((top_row - start_row) as f32 * TABLE_ROW_H);
+        let rows = (0..rows_to_render)
+            .filter_map(|visible_ix| {
+                let row_ix = start_row + visible_ix;
+                let track_ix = *indices.get(row_ix)?;
+                let top = first_row_top + visible_ix as f32 * TABLE_ROW_H;
+                Some(self.render_fast_track_row(top, track_ix, &self.tracks[track_ix]))
+            })
+            .collect::<Vec<_>>();
+
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .overflow_hidden()
+            .bg(rgb(0x131419))
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_fast_track_row(&self, top: f32, track_ix: usize, track: &Track) -> AnyElement {
+        let active = track_ix == self.playing_track;
+        let selected = track_ix == self.active_selected_track();
+        let bg = if selected {
+            0x30323a
+        } else if active {
+            0x25262c
+        } else {
+            0x131419
+        };
+        let title_color = if active { 0xeeb17d } else { 0xe2e2e7 };
+
+        div()
+            .absolute()
+            .top(px(top))
+            .left_0()
+            .right_0()
+            .h(px(TABLE_ROW_H))
+            .px_4()
+            .flex()
+            .items_center()
+            .border_b_1()
+            .border_color(rgb(0x202127))
+            .bg(rgb(bg))
+            .child(
+                div()
+                    .w(px(self.column_width(TableColumn::Index)))
+                    .text_xs()
+                    .text_color(rgb(0x6d717a))
+                    .child(if active {
+                        if self.is_playing { "Ⅱ" } else { "▶" }.into()
+                    } else {
+                        format!("{:02}", track_ix + 1)
+                    }),
+            )
+            .child(
+                div()
+                    .w(px(self.column_width(TableColumn::Artwork)))
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(0x3a3d45))
+                            .overflow_hidden()
+                            .child(Self::album_tile_fallback(
+                                track.album_initials.clone(),
+                                track.album_color,
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(self.column_width(TableColumn::Title)))
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(title_color))
+                    .child(track.title.clone()),
+            )
+            .child(Self::cell(
+                track.album.clone(),
+                self.column_width(TableColumn::Album),
+            ))
+            .child(Self::cell(
+                track.codec.clone(),
+                self.column_width(TableColumn::Format),
+            ))
+            .child(Self::cell(
+                track.plays.clone(),
+                self.column_width(TableColumn::Plays),
+            ))
+            .child(Self::cell(
+                track.duration.clone(),
+                self.column_width(TableColumn::Duration),
+            ))
+            .child(
+                div()
+                    .w(px(self.column_width(TableColumn::Loved)))
+                    .text_color(rgb(0xf0b282))
+                    .child(if track.loved { "♥" } else { "" }),
+            )
+            .into_any_element()
+    }
+
+    fn render_table_scrollbar(&self, item_count: usize, cx: &mut Context<Self>) -> AnyElement {
+        if item_count == 0 {
+            return div().into_any_element();
+        }
+
+        let metrics = self.table_scrollbar_metrics();
+        let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
+        let thumb_height =
+            metrics.map_or(TABLE_SCROLLBAR_MIN_THUMB_H, |metrics| metrics.thumb_height);
+        let track_height = metrics.map_or(0.0, |metrics| metrics.track_height);
+        let scrollable = metrics.is_some_and(|metrics| metrics.max_scroll > 0.0);
+        let current_label = metrics.and_then(|metrics| self.current_scrollbar_label(metrics));
+        let max_markers = if track_height > 0.0 {
+            ((track_height / 16.0).floor() as usize).clamp(2, TABLE_SCROLLBAR_MAX_MARKERS)
+        } else {
+            0
+        };
+        let marker_stride = self
+            .active_tab()
+            .scrollbar_markers
+            .len()
+            .saturating_add(max_markers.saturating_sub(1))
+            / max_markers.max(1);
+        let marker_stride = marker_stride.max(1);
+        let markers = self
+            .active_tab()
+            .scrollbar_markers
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, marker)| {
+                if ix % marker_stride != 0 {
+                    return None;
+                }
+
+                let top = TABLE_SCROLLBAR_MARGIN + marker.ratio.clamp(0.0, 1.0) * track_height;
+                Some(
+                    div()
+                        .absolute()
+                        .top(px((top - 7.0).max(TABLE_SCROLLBAR_MARGIN)))
+                        .right(px(14.0))
+                        .w(px(30.0))
+                        .h(px(14.0))
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .text_xs()
+                        .text_color(rgb(0x6f7480))
+                        .child(marker.label.clone())
+                        .into_any_element(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let current_label_top = (TABLE_SCROLLBAR_MARGIN + thumb_top + thumb_height / 2.0 - 9.0)
+            .clamp(
+                TABLE_SCROLLBAR_MARGIN,
+                (track_height - 18.0).max(TABLE_SCROLLBAR_MARGIN),
+            );
+
+        div()
+            .id("table-scrollbar")
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(px(TABLE_SCROLLBAR_W))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    if this.begin_table_scrollbar_drag(event) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.drag_table_scrollbar(event) {
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
+                    if this.finish_table_scrollbar_drag() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
+            .children(markers)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(TABLE_SCROLLBAR_MARGIN))
+                    .right(px(4.0))
+                    .bottom(px(TABLE_SCROLLBAR_MARGIN))
+                    .w(px(TABLE_SCROLLBAR_TRACK_W))
+                    .rounded_full()
+                    .bg(rgb(0x1d1f26))
+                    .opacity(if scrollable { 0.95 } else { 0.45 })
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(thumb_top))
+                            .left(px(1.0))
+                            .right(px(1.0))
+                            .h(px(thumb_height))
+                            .rounded_full()
+                            .bg(rgb(if self.table_scrollbar_drag.is_some() {
+                                0xb2b8c4
+                            } else {
+                                0x767b86
+                            })),
+                    ),
+            )
+            .when(scrollable, |this| {
+                this.when_some(current_label, |this, label| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top(px(current_label_top))
+                            .right(px(15.0))
+                            .max_w(px(36.0))
+                            .h(px(18.0))
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgb(0x252832))
+                            .border_1()
+                            .border_color(rgb(0x3c414d))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(rgb(0xd3d6df))
+                            .overflow_hidden()
+                            .child(label),
+                    )
+                })
+            })
+            .into_any_element()
     }
 
     fn render_table_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -2056,7 +2948,7 @@ impl TempoApp {
         }
     }
 
-    fn cached_waveform(&mut self, track_ix: usize, cx: &mut Context<Self>) -> Vec<f32> {
+    fn cached_waveform(&mut self, track_ix: usize, cx: &mut Context<Self>) -> (Vec<f32>, bool) {
         if self.waveform_cache.len() < self.tracks.len() {
             self.waveform_cache.resize_with(self.tracks.len(), || None);
         }
@@ -2065,12 +2957,10 @@ impl TempoApp {
         }
 
         if let Some(waveform) = self.waveform_cache[track_ix].as_ref() {
-            return waveform.clone();
+            return (waveform.clone(), self.waveform_loading[track_ix]);
         }
 
         let source = WaveformSource::from_track(&self.tracks[track_ix]);
-        let fallback = Self::generate_fallback_waveform(&source);
-        self.waveform_cache[track_ix] = Some(fallback.clone());
 
         if !self.waveform_loading[track_ix] {
             self.waveform_loading[track_ix] = true;
@@ -2098,7 +2988,10 @@ impl TempoApp {
             .detach();
         }
 
-        fallback
+        (
+            Self::generate_loading_waveform(Self::waveform_loading_phase()),
+            true,
+        )
     }
 
     fn generate_audio_waveform(track: &WaveformSource) -> Vec<f32> {
@@ -2111,18 +3004,26 @@ impl TempoApp {
         let duration = decoder.total_duration().unwrap_or(track.duration_value);
         let sample_rate = decoder.sample_rate().get() as f64;
         let channels = decoder.channels().get() as f64;
-        let total_samples = duration.as_secs_f64() * sample_rate * channels;
+        let total_samples = (duration.as_secs_f64() * sample_rate * channels)
+            .ceil()
+            .max(1.0) as usize;
 
-        if total_samples <= 0.0 {
+        if total_samples == 0 {
             return None;
         }
 
         let mut peaks = vec![0.0_f32; WAVEFORM_SEGMENTS];
         let mut saw_sample = false;
+        let samples_per_bin = (total_samples / WAVEFORM_SEGMENTS).max(1);
+        let mut bin = 0;
+        let mut next_bin_sample = samples_per_bin;
 
         for (sample_ix, sample) in decoder.by_ref().enumerate() {
-            let bin = ((sample_ix as f64 / total_samples) * WAVEFORM_SEGMENTS as f64) as usize;
-            let bin = bin.min(WAVEFORM_SEGMENTS - 1);
+            while sample_ix >= next_bin_sample && bin < WAVEFORM_SEGMENTS - 1 {
+                bin += 1;
+                next_bin_sample = next_bin_sample.saturating_add(samples_per_bin);
+            }
+
             peaks[bin] = peaks[bin].max(sample.abs());
             saw_sample = true;
         }
@@ -2170,6 +3071,24 @@ impl TempoApp {
             .collect()
     }
 
+    fn generate_loading_waveform(phase: f32) -> Vec<f32> {
+        (0..WAVEFORM_SEGMENTS)
+            .map(|ix| {
+                let position = ix as f32 / 12.0;
+                let sweep = ((position - phase).sin() + 1.0) * 0.5;
+                let ripple = ((position * 0.35 + phase * 0.6).sin() + 1.0) * 0.5;
+                (10.0 + (sweep * 0.7 + ripple * 0.3) * 42.0).round()
+            })
+            .collect()
+    }
+
+    fn waveform_loading_phase() -> f32 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as f32 / 90.0)
+            .unwrap_or_default()
+    }
+
     fn render_track_row(
         &self,
         row_ix: usize,
@@ -2190,7 +3109,7 @@ impl TempoApp {
 
         div()
             .id(SharedString::from(format!("track-row-{track_ix}")))
-            .h(px(32.0))
+            .h(px(TABLE_ROW_H))
             .px_4()
             .flex()
             .items_center()
@@ -2223,6 +3142,13 @@ impl TempoApp {
                     this.context_menu_row = row_ix;
                     cx.notify();
                 }),
+            )
+            .on_drag(
+                TrackDrag::new(track_ix, track),
+                |drag: &TrackDrag, position, _, cx| {
+                    let preview = drag.clone().position(position);
+                    cx.new(|_| preview)
+                },
             )
             .child(
                 div()
@@ -2291,7 +3217,7 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let track = &self.tracks[track_ix];
-        let top = 27.0 + ((self.context_menu_row as f32 + 1.0) * 32.0).min(560.0);
+        let top = 27.0 + ((self.context_menu_row as f32 + 1.0) * TABLE_ROW_H).min(560.0);
 
         div()
             .absolute()
@@ -2348,6 +3274,33 @@ impl TempoApp {
                     },
                 )),
             )
+            .when(!self.playlists.is_empty(), |this| {
+                this.child(
+                    div()
+                        .mt_1()
+                        .px_3()
+                        .pt_2()
+                        .pb_1()
+                        .border_t_1()
+                        .border_color(rgb(0x2b2d35))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(rgb(0x777b84))
+                        .child("ADD TO PLAYLIST"),
+                )
+                .children(
+                    self.playlists
+                        .iter()
+                        .enumerate()
+                        .map(|(playlist_ix, playlist)| {
+                            Self::context_menu_item_dynamic(format!("Add to {}", playlist.name))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.add_track_to_playlist(track_ix, playlist_ix);
+                                    cx.notify();
+                                }))
+                        }),
+                )
+            })
             .child(Self::context_menu_item("Go to album"))
             .child(Self::context_menu_item("Show file"))
     }
@@ -2365,9 +3318,24 @@ impl TempoApp {
             .child(label)
     }
 
+    fn context_menu_item_dynamic(label: String) -> gpui::Stateful<gpui::Div> {
+        let id = SharedString::from(format!("context-menu-{label}"));
+
+        div()
+            .id(id)
+            .h(px(28.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .text_color(rgb(0xc9ccd4))
+            .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+            .child(label)
+    }
+
     fn album_tile(track: &Track, size: f32) -> AnyElement {
-        let initials = Self::album_initials(track);
-        let color = Self::album_color(track);
+        let initials = track.album_initials.clone();
+        let color = track.album_color;
         let fallback_initials = initials.clone();
 
         div()
@@ -2410,11 +3378,11 @@ impl TempoApp {
             .into_any_element()
     }
 
-    fn album_initials(track: &Track) -> String {
-        let source = if track.album == "Unknown Album" {
-            &track.title
+    fn album_initials_for(album: &str, title: &str) -> String {
+        let source = if album == "Unknown Album" {
+            title
         } else {
-            &track.album
+            album
         };
 
         let mut initials = source
@@ -2431,9 +3399,9 @@ impl TempoApp {
         initials
     }
 
-    fn album_color(track: &Track) -> u32 {
+    fn album_color_for(album: &str, artist: &str) -> u32 {
         let mut hash = 0xcbf29ce484222325_u64;
-        for byte in track.album.bytes().chain(track.artist.bytes()) {
+        for byte in album.bytes().chain(artist.bytes()) {
             hash ^= byte as u64;
             hash = hash.wrapping_mul(0x100000001b3);
         }
@@ -2872,7 +3840,7 @@ impl TempoApp {
             .child(label)
     }
 
-    fn render_player_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_player_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.tracks.is_empty() {
             return div()
                 .h(px(86.0))
@@ -2923,16 +3891,10 @@ impl TempoApp {
         }
 
         self.playing_track = self.playing_track.min(self.tracks.len() - 1);
-        let has_loaded_playback = self
-            .playback
-            .as_ref()
-            .is_some_and(|playback| !playback.is_empty());
-        let waveform = if self.is_playing || has_loaded_playback {
-            self.cached_waveform(self.playing_track, cx)
-        } else {
-            let source = WaveformSource::from_track(&self.tracks[self.playing_track]);
-            Self::generate_fallback_waveform(&source)
-        };
+        let (waveform, waveform_loading) = self.cached_waveform(self.playing_track, cx);
+        if waveform_loading {
+            window.request_animation_frame();
+        }
         let playback_position = self.playback_position();
         let track = &self.tracks[self.playing_track];
         let playback_position = playback_position.min(track.duration_value);
@@ -2988,6 +3950,7 @@ impl TempoApp {
                         track.duration.clone(),
                         playback_progress,
                         waveform,
+                        waveform_loading,
                         cx,
                     )),
             )
@@ -3037,6 +4000,7 @@ impl TempoApp {
         duration: String,
         progress: f32,
         waveform: Vec<f32>,
+        loading: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let progress_segments = (waveform.len() as f32 * progress).round() as usize;
@@ -3083,9 +4047,24 @@ impl TempoApp {
                     .items_center()
                     .gap(px(1.0))
                     .children(waveform.into_iter().enumerate().map(move |(ix, height)| {
-                        Self::waveform_bar(ix, height, progress_segments)
+                        Self::waveform_bar(ix, height, progress_segments, loading)
                     })),
             )
+            .when(loading, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top_2()
+                        .left_3()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(0x111218))
+                        .text_xs()
+                        .text_color(rgb(0x9bbdff))
+                        .child("Loading waveform"),
+                )
+            })
             .child(
                 div()
                     .absolute()
@@ -3112,11 +4091,20 @@ impl TempoApp {
             )
     }
 
-    fn waveform_bar(ix: usize, height: f32, progress_segments: usize) -> impl IntoElement {
+    fn waveform_bar(
+        ix: usize,
+        height: f32,
+        progress_segments: usize,
+        loading: bool,
+    ) -> impl IntoElement {
         let played = ix < progress_segments;
         let playhead = ix == progress_segments;
         let peak = height > 44.0;
-        let color = if playhead {
+        let color = if loading && peak {
+            0x6f9dff
+        } else if loading {
+            0x444a58
+        } else if playhead {
             0xd7e5ff
         } else if played && peak {
             0x9bbdff
@@ -3134,7 +4122,11 @@ impl TempoApp {
             .h(px(if playhead { 58.0 } else { height }))
             .rounded_full()
             .bg(rgb(color))
-            .opacity(if played || playhead { 1.0 } else { 0.78 })
+            .opacity(if loading || played || playhead {
+                1.0
+            } else {
+                0.78
+            })
     }
 
     fn transport_overlay(is_playing: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
