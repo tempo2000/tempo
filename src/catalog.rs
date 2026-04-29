@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    mem::size_of,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -247,23 +248,38 @@ impl CatalogStore {
                 updated_at INTEGER NOT NULL
              );
 
-             CREATE TABLE IF NOT EXISTS metadata_jobs (
-                id INTEGER PRIMARY KEY,
-                entity_type TEXT NOT NULL,
-                entity_id INTEGER NOT NULL,
+              CREATE TABLE IF NOT EXISTS metadata_jobs (
+                 id INTEGER PRIMARY KEY,
+                 entity_type TEXT NOT NULL,
+                 entity_id INTEGER NOT NULL,
                 job_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at INTEGER NOT NULL,
                 last_error TEXT,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL,
-                UNIQUE(entity_type, entity_id, job_type)
+                 updated_at INTEGER NOT NULL,
+                 UNIQUE(entity_type, entity_id, job_type)
               );
 
-             CREATE TABLE IF NOT EXISTS discography_items (
-                id INTEGER PRIMARY KEY,
-                artist_id INTEGER NOT NULL REFERENCES artists(id),
+              CREATE TABLE IF NOT EXISTS waveform_cache (
+                 id INTEGER PRIMARY KEY,
+                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                 segments INTEGER NOT NULL,
+                 version INTEGER NOT NULL,
+                 size_bytes INTEGER NOT NULL,
+                 modified_at INTEGER,
+                 device_id INTEGER,
+                 inode INTEGER,
+                 peaks BLOB NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL,
+                 UNIQUE(file_id, segments, version)
+              );
+
+              CREATE TABLE IF NOT EXISTS discography_items (
+                 id INTEGER PRIMARY KEY,
+                 artist_id INTEGER NOT NULL REFERENCES artists(id),
                 title TEXT NOT NULL,
                 normalized_title TEXT NOT NULL,
                 year TEXT,
@@ -286,6 +302,7 @@ impl CatalogStore {
               CREATE INDEX IF NOT EXISTS albums_artist_idx ON albums(artist_id);
               CREATE INDEX IF NOT EXISTS artists_name_idx ON artists(normalized_name);
               CREATE INDEX IF NOT EXISTS metadata_jobs_pending_idx ON metadata_jobs(status, next_attempt_at);
+              CREATE INDEX IF NOT EXISTS waveform_cache_file_idx ON waveform_cache(file_id);
               CREATE INDEX IF NOT EXISTS discography_artist_idx ON discography_items(artist_id, sort_key);",
         )?;
         Ok(())
@@ -509,6 +526,114 @@ impl CatalogStore {
              WHERE path = ?2",
             params![now, path.display().to_string()],
         )?;
+        Ok(())
+    }
+
+    pub fn load_waveform(
+        &self,
+        path: &Path,
+        segments: usize,
+        version: u32,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some(current_fingerprint) = CatalogFileFingerprint::from_path(path) else {
+            return Ok(None);
+        };
+
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT
+                    waveform_cache.size_bytes, waveform_cache.modified_at,
+                    waveform_cache.device_id, waveform_cache.inode, waveform_cache.peaks
+                 FROM waveform_cache
+                 JOIN files ON files.id = waveform_cache.file_id
+                 WHERE files.path = ?1
+                   AND files.status = 'present'
+                   AND waveform_cache.segments = ?2
+                   AND waveform_cache.version = ?3",
+                params![
+                    path.display().to_string(),
+                    segments.min(i64::MAX as usize) as i64,
+                    i64::from(version),
+                ],
+                |row| {
+                    Ok((
+                        CatalogFileFingerprint {
+                            size_bytes: row.get::<_, i64>(0)?.max(0) as u64,
+                            modified_at: row.get(1)?,
+                            device_id: row.get(2)?,
+                            inode: row.get(3)?,
+                        },
+                        row.get::<_, Vec<u8>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((cached_fingerprint, peaks)) = row else {
+            return Ok(None);
+        };
+
+        if !cached_fingerprint.matches(&current_fingerprint) {
+            return Ok(None);
+        }
+
+        Ok(waveform_from_blob(&peaks, segments))
+    }
+
+    pub fn save_waveform(
+        &self,
+        path: &Path,
+        segments: usize,
+        version: u32,
+        peaks: &[f32],
+    ) -> Result<()> {
+        if peaks.len() != segments {
+            return Ok(());
+        }
+
+        let Some(fingerprint) = CatalogFileFingerprint::from_path(path) else {
+            return Ok(());
+        };
+
+        let connection = self.connect()?;
+        let file_id = connection
+            .query_row(
+                "SELECT id FROM files WHERE path = ?1 AND status = 'present'",
+                params![path.display().to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let Some(file_id) = file_id else {
+            return Ok(());
+        };
+
+        let now = now_millis();
+        connection.execute(
+            "INSERT INTO waveform_cache(
+                file_id, segments, version, size_bytes, modified_at, device_id, inode,
+                peaks, created_at, updated_at
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT(file_id, segments, version) DO UPDATE SET
+                size_bytes = excluded.size_bytes,
+                modified_at = excluded.modified_at,
+                device_id = excluded.device_id,
+                inode = excluded.inode,
+                peaks = excluded.peaks,
+                updated_at = excluded.updated_at",
+            params![
+                file_id,
+                segments.min(i64::MAX as usize) as i64,
+                i64::from(version),
+                fingerprint.size_bytes.min(i64::MAX as u64) as i64,
+                fingerprint.modified_at,
+                fingerprint.device_id,
+                fingerprint.inode,
+                waveform_to_blob(peaks),
+                now,
+            ],
+        )?;
+
         Ok(())
     }
 
@@ -1389,6 +1514,26 @@ fn path_in_roots(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 
+fn waveform_to_blob(peaks: &[f32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(peaks.len() * size_of::<f32>());
+    for peak in peaks {
+        blob.extend_from_slice(&peak.to_le_bytes());
+    }
+    blob
+}
+
+fn waveform_from_blob(blob: &[u8], segments: usize) -> Option<Vec<f32>> {
+    if blob.len() != segments * size_of::<f32>() {
+        return None;
+    }
+
+    Some(
+        blob.chunks_exact(size_of::<f32>())
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+    )
+}
+
 fn root_path_filter(roots: &[PathBuf]) -> (String, Vec<String>) {
     let mut clauses = Vec::with_capacity(roots.len());
     let mut params = Vec::with_capacity(roots.len() * 2);
@@ -1625,6 +1770,93 @@ mod tests {
         assert_eq!(albums[0].title, "First");
         assert_eq!(albums[0].artwork_path.as_ref(), Some(&cover_path));
         assert_eq!(albums[0].track_count, 2);
+    }
+
+    #[test]
+    fn stores_and_loads_waveform_cache() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore {
+            db_path: temp_dir.path().join("tempo.sqlite"),
+            cache_dir: temp_dir.path().join("cache"),
+        };
+        store.migrate().unwrap();
+
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("one.flac");
+        fs::write(&path, b"audio").unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: path.clone(),
+                    title: "One".to_string(),
+                    artist: "Alice".to_string(),
+                    album: "First".to_string(),
+                    year: Some("2024".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 5,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        let peaks = vec![8.0, 16.5, 58.0];
+        store.save_waveform(&path, peaks.len(), 1, &peaks).unwrap();
+
+        assert_eq!(
+            store.load_waveform(&path, peaks.len(), 1).unwrap(),
+            Some(peaks)
+        );
+        assert_eq!(store.load_waveform(&path, 4, 1).unwrap(), None);
+        assert_eq!(store.load_waveform(&path, 3, 2).unwrap(), None);
+    }
+
+    #[test]
+    fn invalidates_waveform_cache_when_file_changes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let store = CatalogStore {
+            db_path: temp_dir.path().join("tempo.sqlite"),
+            cache_dir: temp_dir.path().join("cache"),
+        };
+        store.migrate().unwrap();
+
+        let root = temp_dir.path().join("library");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("one.flac");
+        fs::write(&path, b"audio").unwrap();
+        store
+            .upsert_track(
+                &Track {
+                    path: path.clone(),
+                    title: "One".to_string(),
+                    artist: "Alice".to_string(),
+                    album: "First".to_string(),
+                    year: Some("2024".to_string()),
+                    duration: Duration::from_secs(60),
+                    codec: "FLAC".to_string(),
+                    sample_rate: None,
+                    channels: None,
+                    bitrate: None,
+                    file_size: 5,
+                    modified: None,
+                    artwork: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        store
+            .save_waveform(&path, 3, 1, &[8.0, 16.5, 58.0])
+            .unwrap();
+        fs::write(&path, b"changed audio").unwrap();
+
+        assert_eq!(store.load_waveform(&path, 3, 1).unwrap(), None);
     }
 
     #[test]
