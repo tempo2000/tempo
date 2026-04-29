@@ -292,16 +292,21 @@ struct Track {
     artist_id: Option<i64>,
     album_id: Option<i64>,
     path: PathBuf,
-    title: String,
-    artist: String,
-    album: String,
-    genre: String,
+    // Hot, render-path text fields are `SharedString` (Arc-shared) so
+    // every per-cell `.clone()` in the table/queue/player bar is a
+    // refcount bump rather than a fresh allocation. Previously these
+    // were `String` and each visible row cloned all of them on every
+    // repaint.
+    title: SharedString,
+    artist: SharedString,
+    album: SharedString,
+    genre: SharedString,
     track_number: Option<u32>,
-    year: String,
+    year: SharedString,
     date_added: SystemTime,
-    duration: String,
+    duration: SharedString,
     duration_value: Duration,
-    codec: String,
+    codec: SharedString,
     bitrate: Option<u32>,
     file_size: u64,
     plays: u32,
@@ -355,15 +360,17 @@ struct MetadataDemandQueue {
 #[derive(Clone)]
 struct WaveformSource {
     path: PathBuf,
-    title: String,
-    artist: String,
-    album: String,
-    duration: String,
+    title: SharedString,
+    artist: SharedString,
+    album: SharedString,
+    duration: SharedString,
     duration_value: Duration,
 }
 
 impl WaveformSource {
     fn from_track(track: &Track) -> Self {
+        // All four text fields are `SharedString`, so the clones are
+        // refcount bumps, not allocations.
         Self {
             path: track.path.clone(),
             title: track.title.clone(),
@@ -1001,7 +1008,11 @@ pub(crate) struct TempoApp {
     artist_view_mode: BrowseViewMode,
     album_view_mode: BrowseViewMode,
     queue: Vec<usize>,
-    waveform_cache: Vec<Option<Vec<f32>>>,
+    /// Per-track waveform cache. `Arc<[f32]>` so the per-frame
+    /// `cached_waveform` lookup hands out a refcount-bumped slice
+    /// instead of cloning the underlying ~360-float buffer on every
+    /// repaint while a track plays.
+    waveform_cache: Vec<Option<Arc<[f32]>>>,
     waveform_loading: Vec<bool>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
@@ -1155,6 +1166,12 @@ impl TempoApp {
             // flushed even if the debounce window for the background save
             // thread hadn't elapsed yet.
             perf::time("shutdown.save_app_state", "", || app.save_app_state_now());
+            // `PRAGMA optimize` is cheap on a clean shutdown and lets
+            // SQLite refresh its query-plan statistics for the next
+            // launch. Failures are silently ignored.
+            if let Some(catalog) = app.catalog.as_ref() {
+                perf::time("shutdown.catalog_optimize", "", || catalog.run_optimize());
+            }
             async {}
         });
 
@@ -2277,16 +2294,16 @@ impl From<tempo::library::Track> for Track {
             artist_id: None,
             album_id: None,
             path: track.path,
-            title: track.title,
-            artist: track.artist,
-            album: track.album,
-            genre,
+            title: SharedString::from(track.title),
+            artist: SharedString::from(track.artist),
+            album: SharedString::from(track.album),
+            genre: SharedString::from(genre),
             track_number: track.track_number,
-            year,
+            year: SharedString::from(year),
             date_added: track.date_added,
-            duration: format_duration(track.duration),
+            duration: SharedString::from(format_duration(track.duration)),
             duration_value: track.duration,
-            codec: track.codec,
+            codec: SharedString::from(track.codec),
             bitrate: track.bitrate,
             file_size: track.file_size,
             plays: 0,
@@ -2319,16 +2336,16 @@ impl From<CatalogTrack> for Track {
             artist_id: Some(track.artist_id),
             album_id: Some(track.album_id),
             path: track.path,
-            title: track.title,
-            artist: track.artist,
-            album: track.album,
-            genre,
+            title: SharedString::from(track.title),
+            artist: SharedString::from(track.artist),
+            album: SharedString::from(track.album),
+            genre: SharedString::from(genre),
             track_number: track.track_number,
-            year,
+            year: SharedString::from(year),
             date_added: track.date_added,
-            duration: format_duration(track.duration),
+            duration: SharedString::from(format_duration(track.duration)),
             duration_value: track.duration,
-            codec: track.codec,
+            codec: SharedString::from(track.codec),
             bitrate: track.bitrate,
             file_size: track.file_size,
             plays: track.play_count,

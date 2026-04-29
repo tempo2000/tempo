@@ -605,7 +605,7 @@ impl TempoApp {
             SortColumn::Year => Self::marker_initial(&track.year),
             SortColumn::DateAdded => TempoApp::date_label(track.date_added),
             SortColumn::Plays => track.plays.to_string(),
-            SortColumn::Duration => track.duration.clone(),
+            SortColumn::Duration => track.duration.to_string(),
         }
     }
 

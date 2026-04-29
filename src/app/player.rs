@@ -3,7 +3,7 @@ use std::time::Instant;
 
 impl TempoApp {
     fn render_marquee_text(
-        text: String,
+        text: SharedString,
         animation_id: impl Into<SharedString>,
         available_width: f32,
         average_char_width: f32,
@@ -596,7 +596,7 @@ impl TempoApp {
         &mut self,
         track_ix: usize,
         cx: &mut Context<Self>,
-    ) -> (Vec<f32>, bool) {
+    ) -> (Arc<[f32]>, bool) {
         let start = Instant::now();
         if self.waveform_cache.len() < self.tracks.len() {
             self.waveform_cache.resize_with(self.tracks.len(), || None);
@@ -612,7 +612,9 @@ impl TempoApp {
                 Duration::from_millis(2),
                 format!("track_ix={track_ix} segments={}", waveform.len()),
             );
-            return (waveform.clone(), self.waveform_loading[track_ix]);
+            // Refcount bump only -- the caller does not need to mutate
+            // the buffer.
+            return (Arc::clone(waveform), self.waveform_loading[track_ix]);
         }
 
         let source = WaveformSource::from_track(&self.tracks[track_ix]);
@@ -626,9 +628,12 @@ impl TempoApp {
                 format!("track_ix={track_ix} path={}", expected_path.display()),
             );
             cx.spawn(async move |this, cx| {
-                let waveform = cx
+                let waveform: Arc<[f32]> = cx
                     .background_executor()
-                    .spawn(async move { TempoApp::load_or_generate_waveform(&source, catalog) })
+                    .spawn(async move {
+                        let peaks = TempoApp::load_or_generate_waveform(&source, catalog);
+                        Arc::<[f32]>::from(peaks)
+                    })
                     .await;
 
                 let _ = this.update(cx, |app, cx| {
@@ -651,7 +656,9 @@ impl TempoApp {
         }
 
         (
-            Self::generate_loading_waveform(Self::waveform_loading_phase()),
+            Arc::<[f32]>::from(Self::generate_loading_waveform(
+                Self::waveform_loading_phase(),
+            )),
             true,
         )
     }
@@ -948,7 +955,7 @@ impl TempoApp {
         let year_label = if track.year.eq_ignore_ascii_case("unknown year") {
             "Unknown Year".to_string()
         } else {
-            track.year.clone()
+            track.year.to_string()
         };
         let alternate_status = format!("{} | {}", year_label, self.playback_status_label());
         let title_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Title) {
@@ -1046,7 +1053,7 @@ impl TempoApp {
                                     .overflow_hidden()
                                     .text_color(rgb(colors.text_muted))
                                     .child(Self::render_marquee_text(
-                                        Self::bitrate_label(track),
+                                        SharedString::from(Self::bitrate_label(track)),
                                         SharedString::from(format!(
                                             "now-playing-bitrate-marquee-{playing_track_ix}"
                                         )),
@@ -1062,7 +1069,7 @@ impl TempoApp {
                                     .overflow_hidden()
                                     .text_color(rgb(colors.text_faint))
                                     .child(Self::render_marquee_text(
-                                        alternate_status,
+                                        SharedString::from(alternate_status),
                                         SharedString::from(format!(
                                             "now-playing-status-marquee-{playing_track_ix}"
                                         )),
@@ -1186,7 +1193,7 @@ impl TempoApp {
                     .h_full()
                     .relative()
                     .child(self.waveform_seekbar(
-                        format_duration(playback_position),
+                        SharedString::from(format_duration(playback_position)),
                         track.duration.clone(),
                         playback_progress,
                         waveform,
@@ -1471,10 +1478,10 @@ impl TempoApp {
 
     pub(super) fn waveform_seekbar(
         &self,
-        elapsed: String,
-        duration: String,
+        elapsed: SharedString,
+        duration: SharedString,
         progress: f32,
-        waveform: Vec<f32>,
+        waveform: Arc<[f32]>,
         loading: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1522,9 +1529,18 @@ impl TempoApp {
                     .flex()
                     .items_center()
                     .gap(px(1.0))
-                    .children(waveform.into_iter().enumerate().map(move |(ix, height)| {
-                        Self::waveform_bar(ix, height, progress_segments, loading, colors)
-                    })),
+                    // `Arc<[f32]>::iter()` borrows the slice -- no clone
+                    // of the underlying buffer per frame, unlike the
+                    // prior `Vec<f32>` which was cloned per render.
+                    .children(
+                        waveform
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .map(move |(ix, height)| {
+                                Self::waveform_bar(ix, height, progress_segments, loading, colors)
+                            }),
+                    ),
             )
             .when(loading, |this| {
                 this.child(

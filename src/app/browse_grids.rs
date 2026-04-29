@@ -459,7 +459,13 @@ impl TempoApp {
         let end = (start + columns).min(artist_indices.len());
 
         div()
-            .id(SharedString::from(format!("artist-grid-row-{row_ix}")))
+            // Per-row id: `NamedInteger` avoids the per-frame String
+            // allocation that the previous `format!()` produced for
+            // each visible row.
+            .id(gpui::ElementId::NamedInteger(
+                "artist-grid-row".into(),
+                row_ix as u64,
+            ))
             .flex()
             .gap_4()
             .pb_4()
@@ -484,7 +490,10 @@ impl TempoApp {
         let end = (start + columns).min(album_indices.len());
 
         div()
-            .id(SharedString::from(format!("album-grid-row-{row_ix}")))
+            .id(gpui::ElementId::NamedInteger(
+                "album-grid-row".into(),
+                row_ix as u64,
+            ))
             .flex()
             .gap_4()
             .pb_4()

@@ -400,24 +400,28 @@ impl TempoApp {
         track_ix: usize,
         track: &Track,
     ) -> String {
+        // Used by column auto-resize only, not the per-row render path.
+        // Hot-path callers receive `SharedString` directly via the
+        // table cells; this converter only fires on user double-click
+        // of a column resizer.
         match column {
             TableColumn::Index => format!("{:02}", track_ix + 1),
             TableColumn::Artwork | TableColumn::Loved => String::new(),
-            TableColumn::Title => track.title.clone(),
-            TableColumn::Artist => track.artist.clone(),
-            TableColumn::Album => track.album.clone(),
-            TableColumn::Genre => track.genre.clone(),
+            TableColumn::Title => track.title.to_string(),
+            TableColumn::Artist => track.artist.to_string(),
+            TableColumn::Album => track.album.to_string(),
+            TableColumn::Genre => track.genre.to_string(),
             TableColumn::TrackNumber => track
                 .track_number
                 .map(|track_number| track_number.to_string())
                 .unwrap_or_default(),
-            TableColumn::Format => track.codec.clone(),
+            TableColumn::Format => track.codec.to_string(),
             TableColumn::Bitrate => Self::bitrate_cell_label(track),
             TableColumn::FileSize => Self::file_size_label(track.file_size),
-            TableColumn::Year => track.year.clone(),
+            TableColumn::Year => track.year.to_string(),
             TableColumn::DateAdded => Self::date_label(track.date_added),
             TableColumn::Plays => track.plays.to_string(),
-            TableColumn::Duration => track.duration.clone(),
+            TableColumn::Duration => track.duration.to_string(),
         }
     }
 
@@ -1839,7 +1843,13 @@ impl TempoApp {
             colors.row
         };
         div()
-            .id(SharedString::from(format!("track-row-{track_ix}")))
+            // `NamedInteger` avoids a per-row String allocation for the
+            // element id. With ~30 rows visible during fast scrolls,
+            // the prior `format!()` was ~30 fresh Strings per frame.
+            .id(gpui::ElementId::NamedInteger(
+                "track-row".into(),
+                track_ix as u64,
+            ))
             .h(px(TABLE_ROW_H))
             .px_4()
             .flex()

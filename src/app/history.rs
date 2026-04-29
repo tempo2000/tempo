@@ -14,10 +14,13 @@ impl TempoApp {
         self.playback_history.push(PlaybackHistoryEntry {
             played_at_unix_secs,
             track_path: track.path.clone(),
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            duration: track.duration.clone(),
+            // History entries are serialized to state.json, so we keep
+            // them as `String`. The `Track` fields became `SharedString`
+            // for the render hot path; convert once here.
+            title: track.title.to_string(),
+            artist: track.artist.to_string(),
+            album: track.album.to_string(),
+            duration: track.duration.to_string(),
         });
         self.save_app_state();
     }
@@ -270,7 +273,10 @@ impl TempoApp {
         };
 
         div()
-            .id(SharedString::from(format!("playback-history-row-{ix}")))
+            .id(gpui::ElementId::NamedInteger(
+                "playback-history-row".into(),
+                ix as u64,
+            ))
             .h(px(TABLE_ROW_H))
             .px_4()
             .flex()
