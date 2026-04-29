@@ -31,6 +31,7 @@ impl TempoApp {
             TableColumn::Title => self.column_widths.title,
             TableColumn::Artist => self.column_widths.artist,
             TableColumn::Album => self.column_widths.album,
+            TableColumn::Genre => self.column_widths.genre,
             TableColumn::TrackNumber => self.column_widths.track_number,
             TableColumn::Format => self.column_widths.format,
             TableColumn::Bitrate => self.column_widths.bitrate,
@@ -105,6 +106,7 @@ impl TempoApp {
             TableColumn::Title => self.column_widths.title = width,
             TableColumn::Artist => self.column_widths.artist = width,
             TableColumn::Album => self.column_widths.album = width,
+            TableColumn::Genre => self.column_widths.genre = width,
             TableColumn::TrackNumber => self.column_widths.track_number = width,
             TableColumn::Format => self.column_widths.format = width,
             TableColumn::Bitrate => self.column_widths.bitrate = width,
@@ -253,7 +255,9 @@ impl TempoApp {
             TableColumn::Format => 44.0,
             TableColumn::TrackNumber | TableColumn::Plays | TableColumn::Duration => 52.0,
             TableColumn::Bitrate | TableColumn::FileSize | TableColumn::Year => 60.0,
-            TableColumn::Title | TableColumn::Artist | TableColumn::Album => 96.0,
+            TableColumn::Title | TableColumn::Artist | TableColumn::Album | TableColumn::Genre => {
+                96.0
+            }
             TableColumn::DateAdded => 82.0,
         }
     }
@@ -402,6 +406,7 @@ impl TempoApp {
             TableColumn::Title => track.title.clone(),
             TableColumn::Artist => track.artist.clone(),
             TableColumn::Album => track.album.clone(),
+            TableColumn::Genre => track.genre.clone(),
             TableColumn::TrackNumber => track
                 .track_number
                 .map(|track_number| track_number.to_string())
@@ -501,6 +506,9 @@ impl TempoApp {
 
         if !sanitized.contains(&TableColumn::Title) {
             sanitized.insert(0, TableColumn::Title);
+        }
+        if sanitized == old_default_visible_table_columns() {
+            sanitized.insert(5, TableColumn::Genre);
         }
         if sanitized.is_empty() {
             default_visible_table_columns()
@@ -1947,6 +1955,7 @@ impl TempoApp {
                 .into_any_element(),
             TableColumn::Artist => self.cell(track.artist.clone(), width).into_any_element(),
             TableColumn::Album => self.cell(track.album.clone(), width).into_any_element(),
+            TableColumn::Genre => self.cell(track.genre.clone(), width).into_any_element(),
             TableColumn::TrackNumber => self
                 .cell(
                     track
@@ -2046,6 +2055,7 @@ impl TempoApp {
             TableColumn::Title => "TITLE",
             TableColumn::Artist => "ARTIST",
             TableColumn::Album => "ALBUM",
+            TableColumn::Genre => "GENRE",
             TableColumn::TrackNumber => "TRK",
             TableColumn::Format => "FMT",
             TableColumn::Bitrate => "BITRATE",
@@ -2073,6 +2083,7 @@ impl TempoApp {
             TableColumn::Title => "title",
             TableColumn::Artist => "artist",
             TableColumn::Album => "album",
+            TableColumn::Genre => "genre",
             TableColumn::TrackNumber => "track-number",
             TableColumn::Format => "format",
             TableColumn::Bitrate => "bitrate",
@@ -2110,6 +2121,7 @@ impl TempoApp {
             TableColumn::Title => Some(SortColumn::Title),
             TableColumn::Artist => Some(SortColumn::Artist),
             TableColumn::Album => Some(SortColumn::Album),
+            TableColumn::Genre => Some(SortColumn::Genre),
             TableColumn::TrackNumber => Some(SortColumn::TrackNumber),
             TableColumn::Format => Some(SortColumn::Format),
             TableColumn::Bitrate => Some(SortColumn::Bitrate),

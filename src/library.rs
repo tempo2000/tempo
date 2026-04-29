@@ -16,7 +16,7 @@ use lofty::{
     file::{AudioFile, TaggedFileExt},
     picture::PictureType,
     read_from_path,
-    tag::{Accessor, Tag},
+    tag::{Accessor, ItemKey, ItemValue, Tag},
 };
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use walkdir::{DirEntry, WalkDir};
@@ -44,6 +44,7 @@ pub struct Track {
     pub title: String,
     pub artist: String,
     pub album: String,
+    pub genre: Option<String>,
     pub track_number: Option<u32>,
     pub year: Option<String>,
     pub duration: Duration,
@@ -75,6 +76,7 @@ pub enum LibraryEvent {
     ScanProgress(ScanProgress),
     TracksIndexed(Vec<Track>),
     TrackRemoved(PathBuf),
+    TracksRemoved(Vec<PathBuf>),
     ScanError(IndexingError),
     ScanFinished,
 }
@@ -353,12 +355,19 @@ impl LibraryIndexer {
                     format!("failed to mark cached files as seen: {error:#}"),
                 );
             }
-            if let Err(error) = catalog.finish_scan(scan_id, &self.roots) {
-                send_error(
-                    events,
-                    PathBuf::new(),
-                    format!("failed to finish catalog scan: {error:#}"),
-                );
+            match catalog.finish_scan(scan_id, &self.roots) {
+                Ok(removed_paths) => {
+                    if !removed_paths.is_empty() {
+                        let _ = events.send(LibraryEvent::TracksRemoved(removed_paths));
+                    }
+                }
+                Err(error) => {
+                    send_error(
+                        events,
+                        PathBuf::new(),
+                        format!("failed to finish catalog scan: {error:#}"),
+                    );
+                }
             }
         }
         let _ = events.send(LibraryEvent::ScanProgress(progress));
@@ -480,7 +489,8 @@ pub fn index_audio_file(path: impl AsRef<Path>) -> Result<Track> {
             .map(|album| album.trim().to_string())
             .filter(|album| !album.is_empty())
             .unwrap_or_else(|| "Unknown Album".to_string()),
-        track_number: tag.and_then(|tag| tag.track()),
+        genre: tag.and_then(genre_from_tag),
+        track_number: tag.and_then(track_number_from_tag),
         year,
         duration: properties.duration(),
         codec: codec_label(path),
@@ -502,6 +512,7 @@ fn track_from_catalog(track: CatalogTrack) -> Track {
         title: track.title,
         artist: track.artist,
         album: track.album,
+        genre: track.genre,
         track_number: track.track_number,
         year: track.year,
         date_added: track.date_added,
@@ -514,6 +525,34 @@ fn track_from_catalog(track: CatalogTrack) -> Track {
         modified: None,
         artwork: track.artwork_path.map(Artwork::File),
     }
+}
+
+fn genre_from_tag(tag: &Tag) -> Option<String> {
+    tag.genre()
+        .map(|genre| genre.trim().to_string())
+        .filter(|genre| !genre.is_empty())
+}
+
+fn track_number_from_tag(tag: &Tag) -> Option<u32> {
+    tag.items()
+        .filter(|item| item.key() == ItemKey::TrackNumber)
+        .filter_map(|item| match item.value() {
+            ItemValue::Text(value) | ItemValue::Locator(value) => parse_track_number(value),
+            _ => None,
+        })
+        .next()
+        .or_else(|| tag.track())
+}
+
+fn parse_track_number(value: &str) -> Option<u32> {
+    let digits = value
+        .trim()
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+
+    digits.parse().ok().filter(|track| *track > 0)
 }
 
 fn find_artwork(path: &Path, tag: Option<&Tag>) -> Option<Artwork> {
@@ -654,7 +693,11 @@ fn record_notify_event(
     };
 
     for path in event.paths {
-        if is_hidden_path(&path, roots, ignore_hidden) || !is_supported_audio_file(&path) {
+        if is_hidden_path(&path, roots, ignore_hidden) {
+            continue;
+        }
+
+        if action != PendingPath::Remove && !is_supported_audio_file(&path) {
             continue;
         }
 
@@ -689,16 +732,27 @@ fn flush_pending(
                 Err(error) => send_error(events, path, error.to_string()),
             },
             PendingPath::Index | PendingPath::Remove => {
-                if let Some(catalog) = catalog
-                    && let Err(error) = catalog.mark_file_removed(&path)
-                {
-                    send_error(
-                        events,
-                        path.clone(),
-                        format!("failed to mark removed file in catalog: {error:#}"),
-                    );
+                if is_supported_audio_file(&path) {
+                    if let Some(catalog) = catalog
+                        && let Err(error) = catalog.mark_file_removed(&path)
+                    {
+                        send_error(
+                            events,
+                            path.clone(),
+                            format!("failed to mark removed file in catalog: {error:#}"),
+                        );
+                    }
+                    removed.insert(path);
+                } else if let Some(catalog) = catalog {
+                    match catalog.mark_folder_removed(&path) {
+                        Ok(paths) => removed.extend(paths),
+                        Err(error) => send_error(
+                            events,
+                            path.clone(),
+                            format!("failed to mark removed folder in catalog: {error:#}"),
+                        ),
+                    }
                 }
-                removed.insert(path);
             }
         }
     }
@@ -707,8 +761,14 @@ fn flush_pending(
         let _ = events.send(LibraryEvent::TracksIndexed(indexed));
     }
 
-    for path in removed {
-        let _ = events.send(LibraryEvent::TrackRemoved(path));
+    if removed.len() == 1 {
+        if let Some(path) = removed.into_iter().next() {
+            let _ = events.send(LibraryEvent::TrackRemoved(path));
+        }
+    } else if !removed.is_empty() {
+        let mut removed = removed.into_iter().collect::<Vec<_>>();
+        removed.sort();
+        let _ = events.send(LibraryEvent::TracksRemoved(removed));
     }
 }
 
@@ -768,6 +828,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_track_number_from_common_tag_values() {
+        assert_eq!(parse_track_number("01"), Some(1));
+        assert_eq!(parse_track_number("01/13"), Some(1));
+        assert_eq!(parse_track_number("Track 07"), Some(7));
+        assert_eq!(parse_track_number(""), None);
+    }
+
+    #[test]
     fn indexes_valid_wav_with_filename_fallbacks() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("No Tags.wav");
@@ -779,6 +847,7 @@ mod tests {
         assert_eq!(track.title, "No Tags");
         assert_eq!(track.artist, "Unknown Artist");
         assert_eq!(track.album, "Unknown Album");
+        assert_eq!(track.genre, None);
         assert_eq!(track.codec, "WAV");
         assert_eq!(track.sample_rate, Some(44_100));
         assert_eq!(track.channels, Some(1));
@@ -859,6 +928,26 @@ mod tests {
     }
 
     #[test]
+    fn remove_events_keep_directory_paths_for_catalog_reconciliation() {
+        let temp = TempDir::new().unwrap();
+        let album = temp.path().join("album");
+        let (tx, _rx) = mpsc::channel();
+        let mut pending = HashMap::new();
+
+        record_notify_event(
+            Event::new(EventKind::Remove(RemoveKind::Folder)).add_path(album.clone()),
+            &[temp.path().to_path_buf()],
+            true,
+            &mut pending,
+        );
+
+        assert_eq!(pending.get(&album), Some(&PendingPath::Remove));
+        flush_pending(&tx, None, &mut pending);
+
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn background_watcher_emits_initial_scan_events() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("initial.wav");
@@ -892,6 +981,9 @@ mod tests {
                 }
                 LibraryEvent::ScanError(error) => panic!("unexpected scan error: {error:?}"),
                 LibraryEvent::ScanProgress(_) => {}
+                LibraryEvent::TracksRemoved(paths) => {
+                    panic!("unexpected remove events: {paths:?}")
+                }
                 LibraryEvent::TrackRemoved(path) => panic!("unexpected remove event: {path:?}"),
             }
         }

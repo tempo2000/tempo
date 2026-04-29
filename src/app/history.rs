@@ -396,7 +396,8 @@ impl TempoApp {
             TableColumn::Artist => self.cell(entry.artist.clone(), width).into_any_element(),
             TableColumn::Album => self.cell(entry.album.clone(), width).into_any_element(),
             TableColumn::Duration => self.cell(entry.duration.clone(), width).into_any_element(),
-            TableColumn::TrackNumber
+            TableColumn::Genre
+            | TableColumn::TrackNumber
             | TableColumn::Format
             | TableColumn::Bitrate
             | TableColumn::FileSize

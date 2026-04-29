@@ -46,8 +46,8 @@ use crate::{
 };
 
 const MAGIC: &[u8; 8] = b"TEMPO_S1";
-const SNAPSHOT_VERSION: u32 = 1;
-const SNAPSHOT_FILE: &str = "startup_snapshot.v1.bin";
+const SNAPSHOT_VERSION: u32 = 2;
+const SNAPSHOT_FILE: &str = "startup_snapshot.v2.bin";
 
 pub struct StartupSnapshot {
     pub tracks: Vec<CatalogTrack>,
@@ -236,6 +236,7 @@ fn write_track(buffer: &mut Vec<u8>, track: &CatalogTrack) {
     write_str(buffer, &track.title);
     write_str(buffer, &track.artist);
     write_str(buffer, &track.album);
+    write_opt_str(buffer, track.genre.as_deref());
     write_opt_u32(buffer, track.track_number);
     write_opt_str(buffer, track.year.as_deref());
     write_u64(buffer, system_time_to_millis(track.date_added));
@@ -257,6 +258,7 @@ fn read_track(cursor: &mut Cursor<'_>) -> Result<CatalogTrack> {
         title: cursor.read_string()?,
         artist: cursor.read_string()?,
         album: cursor.read_string()?,
+        genre: cursor.read_opt_string()?,
         track_number: cursor.read_opt_u32()?,
         year: cursor.read_opt_string()?,
         date_added: millis_to_system_time(cursor.read_u64()?),
@@ -478,6 +480,7 @@ mod tests {
             title: format!("Title {id}"),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            genre: Some("Rock".to_string()),
             track_number: Some(id as u32),
             year: Some("2024".to_string()),
             date_added: UNIX_EPOCH + Duration::from_millis(1_000_000 + id as u64),

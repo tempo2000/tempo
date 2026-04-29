@@ -155,6 +155,13 @@ impl TempoApp {
                     .cmp(&right.album)
                     .then(left.track_number.cmp(&right.track_number))
                     .then(left.title.cmp(&right.title)),
+                SortColumn::Genre => left
+                    .genre
+                    .cmp(&right.genre)
+                    .then(left.artist.cmp(&right.artist))
+                    .then(left.album.cmp(&right.album))
+                    .then(left.track_number.cmp(&right.track_number))
+                    .then(left.title.cmp(&right.title)),
                 SortColumn::TrackNumber => left
                     .track_number
                     .cmp(&right.track_number)
@@ -224,6 +231,7 @@ impl TempoApp {
             SortColumn::Album => "album",
             SortColumn::TrackNumber => "track_number",
             SortColumn::Format => "format",
+            SortColumn::Genre => "genre",
             SortColumn::Bitrate => "bitrate",
             SortColumn::FileSize => "file_size",
             SortColumn::Year => "year",
@@ -254,6 +262,7 @@ impl TempoApp {
             | SortColumn::Artist
             | SortColumn::AlbumByArtist
             | SortColumn::Album
+            | SortColumn::Genre
             | SortColumn::Format
             | SortColumn::Year => self.compute_grouped_scrollbar_markers(indices, sort_column),
             SortColumn::Index
@@ -284,6 +293,7 @@ impl TempoApp {
                 SortColumn::Artist => Self::marker_initial(&track.artist),
                 SortColumn::AlbumByArtist => Self::marker_initial(&track.artist),
                 SortColumn::Album => Self::marker_initial(&track.album),
+                SortColumn::Genre => Self::marker_initial(&track.genre),
                 SortColumn::Format => track.codec.to_ascii_uppercase(),
                 SortColumn::Year => Self::marker_initial(&track.year),
                 SortColumn::Index
@@ -584,6 +594,7 @@ impl TempoApp {
             SortColumn::Artist => Self::marker_initial(&track.artist),
             SortColumn::AlbumByArtist => Self::marker_initial(&track.artist),
             SortColumn::Album => Self::marker_initial(&track.album),
+            SortColumn::Genre => Self::marker_initial(&track.genre),
             SortColumn::TrackNumber => track
                 .track_number
                 .map(|track_number| track_number.to_string())
@@ -932,10 +943,11 @@ impl TempoApp {
         }
 
         let searchable = format!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}",
             track.title,
             track.artist,
             track.album,
+            track.genre,
             track.year,
             track.codec,
             track.path.display()
