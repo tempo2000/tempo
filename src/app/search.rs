@@ -324,7 +324,18 @@ impl TempoApp {
         }
 
         if new_tab {
+            let previous_tab = self.active_tab;
             self.new_search_tab(query);
+            if self
+                .tabs
+                .get(previous_tab)
+                .is_some_and(|tab| tab.source == TabSource::Library)
+            {
+                if let Some(tab) = self.tabs.get_mut(previous_tab) {
+                    tab.search_query.clear();
+                }
+                self.rebuild_track_indices_for_tab(previous_tab);
+            }
         } else if force_current_tab || self.active_tab().source == TabSource::Library {
             self.open_page(Page::Library);
             self.set_search_query(query);
@@ -355,6 +366,15 @@ impl TempoApp {
                 self.set_search_input(query);
                 cx.stop_propagation();
                 cx.notify();
+            }
+            "delete" => {
+                if !modifiers.control
+                    && !modifiers.platform
+                    && !modifiers.alt
+                    && !modifiers.function
+                {
+                    cx.stop_propagation();
+                }
             }
             "escape" => {
                 self.clear_search_query();

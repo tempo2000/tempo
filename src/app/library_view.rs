@@ -11,7 +11,7 @@ impl TempoApp {
                 .flex_1()
                 .min_w_0()
                 .flex()
-                .child(self.render_library(cx))
+                .child(self.render_library(window, cx))
                 .child(self.render_queue(cx))
                 .into_any_element(),
             Page::Artists => self.render_artists_page(window, cx).into_any_element(),
@@ -21,7 +21,11 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn render_library(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_library(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let colors = *self.colors();
 
         div()
@@ -31,7 +35,7 @@ impl TempoApp {
             .flex_col()
             .relative()
             .bg(rgb(colors.surface))
-            .child(self.render_library_header(cx))
+            .child(self.render_library_header(window, cx))
             .when(self.tabs.len() > 1, |this| {
                 this.child(self.render_tab_bar(cx))
             })
@@ -183,11 +187,22 @@ impl TempoApp {
 
     pub(super) fn render_search_box(
         &self,
+        window: &Window,
         placeholder: &'static str,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
         let query = self.top_search_query.as_str();
+        let is_focused = self.search_focus_handle.is_focused(window);
+        let label = if query.is_empty() {
+            if is_focused {
+                "⌕  ".to_string()
+            } else {
+                format!("⌕  {placeholder}")
+            }
+        } else {
+            format!("⌕  {query}")
+        };
 
         div()
             .id("library-search")
@@ -200,7 +215,9 @@ impl TempoApp {
             .px_3()
             .flex()
             .items_center()
+            .overflow_hidden()
             .text_xs()
+            .cursor_pointer()
             .text_color(rgb(if query.is_empty() {
                 colors.text_faint
             } else {
@@ -213,14 +230,28 @@ impl TempoApp {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 this.handle_search_key_down(event, cx);
             }))
-            .child(if query.is_empty() {
-                format!("⌕  {placeholder}")
-            } else {
-                format!("⌕  {query}")
+            .child(label)
+            .when(is_focused, |this| {
+                this.child(
+                    div()
+                        .ml(px(1.0))
+                        .w(px(1.0))
+                        .h(px(14.0))
+                        .bg(rgb(colors.text))
+                        .with_animation(
+                            "search-cursor",
+                            Animation::new(Duration::from_millis(1000)).repeat(),
+                            |this, delta| this.opacity(if delta < 0.5 { 1.0 } else { 0.0 }),
+                        ),
+                )
             })
     }
 
-    pub(super) fn render_library_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_library_header(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let colors = *self.colors();
 
         div()
@@ -254,7 +285,7 @@ impl TempoApp {
             )
             .child(self.render_scan_status(cx))
             .child(div().flex_1())
-            .child(self.render_search_box("Search library", cx))
+            .child(self.render_search_box(window, "Search library", cx))
             .child(
                 self.sidebar_button("⚙", "open-settings")
                     .on_click(cx.listener(|this, _, _, cx| {

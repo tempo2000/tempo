@@ -210,7 +210,13 @@ impl TempoApp {
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
-            .child(self.render_browse_header("Artists", subtitle, self.artist_view_mode, cx))
+            .child(self.render_browse_header(
+                window,
+                "Artists",
+                subtitle,
+                self.artist_view_mode,
+                cx,
+            ))
             .child(match self.artist_view_mode {
                 BrowseViewMode::Grid => self.render_artist_grid(grid_columns, artist_indices, cx),
                 BrowseViewMode::Table => self.render_artist_table(artist_indices, cx),
@@ -248,7 +254,7 @@ impl TempoApp {
             .bg(rgb(colors.surface))
             .flex()
             .flex_col()
-            .child(self.render_browse_header("Albums", subtitle, self.album_view_mode, cx))
+            .child(self.render_browse_header(window, "Albums", subtitle, self.album_view_mode, cx))
             .child(match self.album_view_mode {
                 BrowseViewMode::Grid => self.render_album_grid(grid_columns, album_indices, cx),
                 BrowseViewMode::Table => self.render_album_table(album_indices, cx),
@@ -907,6 +913,7 @@ impl TempoApp {
 
     fn render_browse_header(
         &self,
+        window: &Window,
         title: &'static str,
         subtitle: String,
         mode: BrowseViewMode,
@@ -950,7 +957,7 @@ impl TempoApp {
                     .child(subtitle),
             )
             .child(div().flex_1())
-            .child(self.render_search_box("Search", cx))
+            .child(self.render_search_box(window, "Search", cx))
             .child(
                 div()
                     .flex()

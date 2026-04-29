@@ -7,11 +7,11 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, ClickEvent, Context, CursorStyle, FocusHandle, Image, ImageFormat, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Styled, UniformListScrollHandle, Window, div, img, point, prelude::*, px, rgb,
-    uniform_list,
+    Animation, AnimationExt as _, AnyElement, ClickEvent, Context, CursorStyle, FocusHandle, Image,
+    ImageFormat, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Styled, UniformListScrollHandle, Window, div,
+    img, point, prelude::*, px, rgb, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -1111,8 +1111,10 @@ impl TempoApp {
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_page(Page::Library);
-        self.sync_search_input_to_active_tab();
+        if !matches!(self.page, Page::Library | Page::Artists | Page::Albums) {
+            self.open_page(Page::Library);
+            self.sync_search_input_to_active_tab();
+        }
         window.focus(&self.search_focus_handle);
         cx.notify();
     }
