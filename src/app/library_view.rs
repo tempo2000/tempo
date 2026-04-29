@@ -16,6 +16,7 @@ impl TempoApp {
                 .into_any_element(),
             Page::Artists => self.render_artists_page(window, cx).into_any_element(),
             Page::Albums => self.render_albums_page(window, cx).into_any_element(),
+            Page::ScanErrors => self.render_scan_errors_page(cx).into_any_element(),
             Page::Settings => self.render_settings(cx).into_any_element(),
         }
     }
@@ -36,10 +37,6 @@ impl TempoApp {
             })
             .when_some(self.render_detail_hero(cx), |this, hero| this.child(hero))
             .child(self.render_table(cx))
-            .when(
-                self.show_scan_errors && !self.scan_errors.is_empty(),
-                |this| this.child(self.render_scan_errors_popover(cx)),
-            )
     }
 
     pub(super) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -306,7 +303,7 @@ impl TempoApp {
                         })
                         .child(label)
                         .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.show_scan_errors = !this.show_scan_errors;
+                            this.open_page(Page::ScanErrors);
                             cx.stop_propagation();
                             cx.notify();
                         })),
@@ -314,26 +311,104 @@ impl TempoApp {
             })
     }
 
-    pub(super) fn render_scan_errors_popover(
+    pub(super) fn render_scan_errors_page(
         &self,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let errors = self
+        let subtitle = if self.scan_errors.is_empty() {
+            "No scan errors".to_string()
+        } else {
+            format!(
+                "{} {} from the current scan",
+                self.scan_errors.len(),
+                if self.scan_errors.len() == 1 {
+                    "error"
+                } else {
+                    "errors"
+                }
+            )
+        };
+
+        div()
+            .id("scan-errors-page")
+            .flex_1()
+            .min_w_0()
+            .bg(rgb(colors.surface))
+            .flex()
+            .flex_col()
+            .child(self.render_simple_page_header("Scan Errors", subtitle))
+            .child(
+                div()
+                    .id("scan-errors-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(self.render_scan_errors_table()),
+            )
+    }
+
+    fn render_simple_page_header(&self, title: &'static str, subtitle: String) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .h(px(74.0))
+            .flex_none()
+            .px_4()
+            .border_b_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.app))
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap_1()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_strong))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors.text_muted))
+                    .child(subtitle),
+            )
+    }
+
+    fn render_scan_errors_table(&self) -> impl IntoElement {
+        let colors = *self.colors();
+        let rows = self
             .scan_errors
             .iter()
             .rev()
-            .take(10)
-            .map(|error| {
+            .enumerate()
+            .map(|(ix, error)| {
                 div()
+                    .min_h(px(TABLE_ROW_H))
+                    .px_4()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(colors.button_hover))
+                    .border_color(rgb(colors.row_border))
+                    .bg(rgb(if ix % 2 == 0 {
+                        colors.row
+                    } else {
+                        colors.surface
+                    }))
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_start()
+                    .gap_3()
                     .child(
                         div()
+                            .w(px(52.0))
+                            .flex_none()
+                            .text_color(rgb(colors.text_faint))
+                            .child((ix + 1).to_string()),
+                    )
+                    .child(
+                        div()
+                            .w(px(420.0))
+                            .flex_none()
                             .text_color(rgb(colors.text_strong))
                             .overflow_hidden()
                             .text_ellipsis()
@@ -341,65 +416,41 @@ impl TempoApp {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_color(rgb(colors.text_muted))
                             .child(error.message.clone()),
                     )
-            })
-            .collect::<Vec<_>>();
-        let hidden_count = self.scan_errors.len().saturating_sub(errors.len());
+            });
 
         div()
-            .absolute()
-            .top(px(46.0))
-            .right(px(16.0))
-            .w(px(420.0))
-            .max_h(px(360.0))
-            .rounded_lg()
-            .border_1()
-            .border_color(rgb(colors.border_strong))
-            .bg(rgb(colors.elevated))
-            .shadow_lg()
-            .p_3()
             .flex()
             .flex_col()
-            .gap_2()
             .child(
                 div()
+                    .h(px(27.0))
+                    .px_4()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(colors.text_strong))
-                            .child("Scan errors"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        self.sidebar_button("x", "close-scan-errors")
-                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                this.show_scan_errors = false;
-                                cx.stop_propagation();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
+                    .gap_3()
+                    .border_b_1()
+                    .border_color(rgb(colors.border))
                     .text_xs()
-                    .text_color(rgb(colors.text_muted))
-                    .child("Most recent errors are shown first."),
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_faint))
+                    .child(div().w(px(52.0)).flex_none().child("#"))
+                    .child(div().w(px(420.0)).flex_none().child("PATH"))
+                    .child(div().flex_1().min_w_0().child("ERROR")),
             )
-            .children(errors)
-            .when(hidden_count > 0, |this| {
+            .when(self.scan_errors.is_empty(), |this| {
                 this.child(
                     div()
-                        .pt_1()
-                        .text_xs()
+                        .p_5()
                         .text_color(rgb(colors.text_muted))
-                        .child(format!("+{hidden_count} older errors")),
+                        .child("No scan errors for the current scan."),
                 )
             })
+            .when(!self.scan_errors.is_empty(), |this| this.children(rows))
     }
 
     pub(super) fn format_library_size(tracks: &[Track]) -> String {

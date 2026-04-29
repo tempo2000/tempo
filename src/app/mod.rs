@@ -46,6 +46,7 @@ enum Page {
     Library,
     Artists,
     Albums,
+    ScanErrors,
     Settings,
 }
 
@@ -441,7 +442,6 @@ pub(crate) struct TempoApp {
     playback_status: String,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
-    show_scan_errors: bool,
     is_scanning: bool,
     table_scrollbar_drag: Option<TableScrollbarDrag>,
     table_is_scrolling: bool,
@@ -519,7 +519,6 @@ impl TempoApp {
             playback_status,
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
-            show_scan_errors: false,
             is_scanning: false,
             table_scrollbar_drag: None,
             table_is_scrolling: false,
@@ -578,7 +577,9 @@ impl TempoApp {
 
     fn open_page(&mut self, page: Page) {
         self.page = match page {
-            Page::Library | Page::Artists | Page::Albums if self.library_roots.is_empty() => {
+            Page::Library | Page::Artists | Page::Albums | Page::ScanErrors
+                if self.library_roots.is_empty() =>
+            {
                 Page::Settings
             }
             page => page,

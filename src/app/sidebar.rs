@@ -129,6 +129,15 @@ impl TempoApp {
                 Page::Albums,
                 cx,
             ))
+            .when(self.scan_progress.errors > 0, |this| {
+                this.child(self.render_nav_item(
+                    "Scan Errors",
+                    self.scan_progress.errors.to_string(),
+                    self.page == Page::ScanErrors,
+                    Page::ScanErrors,
+                    cx,
+                ))
+            })
             .child(self.render_nav_item(
                 "Settings",
                 "",

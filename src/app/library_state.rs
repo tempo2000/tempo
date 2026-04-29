@@ -55,10 +55,10 @@ impl TempoApp {
             return;
         };
 
-        if fs::create_dir_all(parent).is_ok() {
-            if let Ok(contents) = serde_json::to_string_pretty(&state) {
-                let _ = fs::write(path, contents);
-            }
+        if fs::create_dir_all(parent).is_ok()
+            && let Ok(contents) = serde_json::to_string_pretty(&state)
+        {
+            let _ = fs::write(path, contents);
         }
     }
 
@@ -251,7 +251,6 @@ impl TempoApp {
                 self.context_menu_track = None;
                 self.scan_progress = ScanProgress::default();
                 self.scan_errors.clear();
-                self.show_scan_errors = false;
                 self.is_scanning = true;
                 self.library_status = format!("Scanning {}", self.library_root_label);
             }
@@ -313,15 +312,14 @@ impl TempoApp {
                 self.scan_errors.push(error);
             }
             LibraryEvent::ScanFinished => {
-                if self.catalog.is_some() {
-                    if let Ok(tracks) =
+                if self.catalog.is_some()
+                    && let Ok(tracks) =
                         Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
-                    {
-                        self.tracks = tracks;
-                        self.waveform_cache.clear();
-                        self.waveform_loading.clear();
-                        self.invalidate_track_indices();
-                    }
+                {
+                    self.tracks = tracks;
+                    self.waveform_cache.clear();
+                    self.waveform_loading.clear();
+                    self.invalidate_track_indices();
                 }
                 self.reload_catalog_browse_data();
                 self.clamp_track_indices();
