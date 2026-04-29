@@ -2,10 +2,12 @@ use super::*;
 
 impl TempoApp {
     pub(super) fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
         div()
             .flex_1()
             .min_w_0()
-            .bg(rgb(0x131419))
+            .bg(rgb(colors.surface))
             .flex()
             .flex_col()
             .child(
@@ -16,14 +18,14 @@ impl TempoApp {
                     .items_center()
                     .justify_between()
                     .border_b_1()
-                    .border_color(rgb(0x24252b))
+                    .border_color(rgb(colors.border))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
                             .when(self.left_sidebar_collapsed, |this| {
-                                this.child(Self::sidebar_button("›", "open-left-sidebar").on_click(
+                                this.child(self.sidebar_button("›", "open-left-sidebar").on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.left_sidebar_collapsed = false;
                                         cx.notify();
@@ -33,7 +35,7 @@ impl TempoApp {
                             .child(
                                 div()
                                     .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(0xf0f0f4))
+                                    .text_color(rgb(colors.text_strong))
                                     .child(if self.library_roots.is_empty() {
                                         "Set Up Tempo"
                                     } else {
@@ -50,8 +52,8 @@ impl TempoApp {
                                 .py_1()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(rgb(0x30323a))
-                                .bg(rgb(0x1b1c22))
+                                .border_color(rgb(colors.waveform_border))
+                                .bg(rgb(colors.button))
                                 .active(|this| this.opacity(0.82))
                                 .child("Back to Library")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -70,17 +72,20 @@ impl TempoApp {
                     .when(self.library_roots.is_empty(), |this| {
                         this.child(self.render_onboarding_card())
                     })
+                    .child(self.render_theme_settings(cx))
                     .child(self.render_library_settings(cx))
                     .child(self.render_playlist_settings(cx)),
             )
     }
 
     pub(super) fn render_onboarding_card(&self) -> impl IntoElement {
+        let colors = *self.colors();
+
         div()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x343741))
-            .bg(rgb(0x1b1c22))
+            .border_color(rgb(colors.border_strong))
+            .bg(rgb(colors.elevated))
             .p_5()
             .flex()
             .flex_col()
@@ -89,35 +94,177 @@ impl TempoApp {
                 div()
                     .text_lg()
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(0xf0f0f4))
+                    .text_color(rgb(colors.text_strong))
                     .child("Choose where Tempo should scan"),
             )
             .child(
                 div()
-                    .text_color(rgb(0xa6aab4))
+                    .text_color(rgb(colors.text_muted))
                     .child("Add one or more music folders to start indexing your local library."),
             )
     }
 
-    pub(super) fn render_library_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_theme_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+        let theme_options = self
+            .themes
+            .iter()
+            .map(|theme| self.render_theme_option(theme, cx))
+            .collect::<Vec<_>>();
+
         div()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x24252b))
-            .bg(rgb(0x17181e))
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
             .overflow_hidden()
             .child(
                 div()
                     .px_4()
                     .py_2()
-                    .bg(rgb(0x1b1c22))
+                    .bg(rgb(colors.elevated))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().font_weight(gpui::FontWeight::BOLD).child("Theme"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(self.theme().name.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(colors.border))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(theme_options),
+            )
+    }
+
+    pub(super) fn render_theme_option(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let theme_colors = theme.colors;
+        let selected = self.theme_id == theme.id;
+        let theme_id = theme.id.clone();
+        let swatches = [
+            theme_colors.app,
+            theme_colors.surface,
+            theme_colors.elevated,
+            theme_colors.accent,
+            theme_colors.text_strong,
+        ];
+
+        div()
+            .id(SharedString::from(format!("theme-option-{}", theme.id)))
+            .min_h(px(58.0))
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if selected {
+                colors.accent
+            } else {
+                colors.border
+            }))
+            .bg(rgb(if selected {
+                colors.selected
+            } else {
+                colors.button
+            }))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_3()
+            .hover(move |this| {
+                this.bg(rgb(if selected {
+                    colors.selected
+                } else {
+                    colors.hover
+                }))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child(theme.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .child(theme.description.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(swatches.into_iter().map(|swatch| {
+                        div()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(colors.border_strong))
+                            .bg(rgb(swatch))
+                    })),
+            )
+            .child(
+                div()
+                    .w(px(56.0))
+                    .text_xs()
+                    .text_color(rgb(if selected {
+                        colors.accent_soft
+                    } else {
+                        colors.text_faint
+                    }))
+                    .child(if selected { "Active" } else { "" }),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_theme(&theme_id);
+                cx.notify();
+            }))
+    }
+
+    pub(super) fn render_library_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
+        div()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
+            .overflow_hidden()
+            .child(
+                div()
+                    .px_4()
+                    .py_2()
+                    .bg(rgb(colors.elevated))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(div().font_weight(gpui::FontWeight::BOLD).child("Library"))
                     .child(
-                        Self::settings_button("Add folder", "add-library-folder").on_click(
-                            cx.listener(|_this, _, _window, cx| {
+                        self.settings_button("Add folder", "add-library-folder")
+                            .on_click(cx.listener(|_this, _, _window, cx| {
                                 let paths = cx.prompt_for_paths(PathPromptOptions {
                                     files: false,
                                     directories: true,
@@ -134,8 +281,7 @@ impl TempoApp {
                                     }
                                 })
                                 .detach();
-                            }),
-                        ),
+                            })),
                     ),
             )
             .child(
@@ -143,18 +289,22 @@ impl TempoApp {
                     .px_4()
                     .py_3()
                     .border_t_1()
-                    .border_color(rgb(0x24252b))
+                    .border_color(rgb(colors.border))
                     .flex()
                     .flex_col()
                     .gap_2()
                     .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(if self.is_scanning { 0xeeb17d } else { 0x858993 }))
+                            .text_color(rgb(if self.is_scanning {
+                                colors.accent
+                            } else {
+                                colors.text_muted
+                            }))
                             .child(self.visible_scan_status()),
                     )
                     .when(self.library_roots.is_empty(), |this| {
-                        this.child(div().text_color(rgb(0xc9ccd4)).child(
+                        this.child(div().text_color(rgb(colors.text)).child(
                             "No folders configured. Use Add folder to choose one or more roots.",
                         ))
                     })
@@ -166,7 +316,7 @@ impl TempoApp {
                     )
                     .when(PathBuf::from("/mnt/data/music").is_dir(), |this| {
                         this.child(
-                            Self::settings_button("Add /mnt/data/music", "add-mounted-music")
+                            self.settings_button("Add /mnt/data/music", "add-mounted-music")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.add_library_roots(
                                         vec![PathBuf::from("/mnt/data/music")],
@@ -186,13 +336,15 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let root_label = root.display().to_string();
+        let colors = *self.colors();
+
         div()
             .min_h(px(34.0))
             .px_3()
             .rounded_md()
-            .bg(rgb(0x131419))
+            .bg(rgb(colors.row))
             .border_1()
-            .border_color(rgb(0x24252b))
+            .border_color(rgb(colors.border))
             .flex()
             .items_center()
             .gap_3()
@@ -202,16 +354,15 @@ impl TempoApp {
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_color(rgb(0xd8d8dd))
+                    .text_color(rgb(colors.text))
                     .child(root_label),
             )
             .child(
-                Self::settings_button("Remove", &format!("remove-library-root-{ix}")).on_click(
-                    cx.listener(move |this, _, _, cx| {
+                self.settings_button("Remove", &format!("remove-library-root-{ix}"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.remove_library_root(ix, cx);
                         cx.notify();
-                    }),
-                ),
+                    })),
             )
     }
 
@@ -219,28 +370,29 @@ impl TempoApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x24252b))
-            .bg(rgb(0x17181e))
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.surface))
             .overflow_hidden()
             .child(
                 div()
                     .px_4()
                     .py_2()
-                    .bg(rgb(0x1b1c22))
+                    .bg(rgb(colors.elevated))
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(div().font_weight(gpui::FontWeight::BOLD).child("Playlists"))
                     .child(
-                        Self::settings_button("New playlist", "new-playlist-settings").on_click(
-                            cx.listener(|this, _, _, cx| {
+                        self.settings_button("New playlist", "new-playlist-settings")
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.create_playlist();
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     ),
             )
             .child(
@@ -248,14 +400,14 @@ impl TempoApp {
                     .px_4()
                     .py_3()
                     .border_t_1()
-                    .border_color(rgb(0x24252b))
+                    .border_color(rgb(colors.border))
                     .flex()
                     .flex_col()
                     .gap_2()
                     .when(self.playlists.is_empty(), |this| {
                         this.child(
                             div()
-                                .text_color(rgb(0xc9ccd4))
+                                .text_color(rgb(colors.text))
                                 .child("No playlists yet. Create one to start organizing tracks."),
                         )
                     })
@@ -263,22 +415,25 @@ impl TempoApp {
                         self.playlists
                             .iter()
                             .enumerate()
-                            .map(|(ix, playlist)| Self::render_playlist_settings_row(ix, playlist)),
+                            .map(|(ix, playlist)| self.render_playlist_settings_row(ix, playlist)),
                     ),
             )
     }
 
     pub(super) fn render_playlist_settings_row(
+        &self,
         ix: usize,
         playlist: &Playlist,
     ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .min_h(px(34.0))
             .px_3()
             .rounded_md()
-            .bg(rgb(0x131419))
+            .bg(rgb(colors.row))
             .border_1()
-            .border_color(rgb(0x24252b))
+            .border_color(rgb(colors.border))
             .flex()
             .items_center()
             .justify_between()
@@ -287,23 +442,25 @@ impl TempoApp {
                     .min_w_0()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .text_color(rgb(0xd8d8dd))
+                    .text_color(rgb(colors.text))
                     .child(playlist.name.clone()),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x858993))
+                    .text_color(rgb(colors.text_muted))
                     .child(format!("{} tracks", playlist.track_paths.len())),
             )
             .id(SharedString::from(format!("settings-playlist-{ix}")))
     }
 
     pub(super) fn settings_button(
+        &self,
         label: &'static str,
         id: impl Into<SharedString>,
     ) -> gpui::Stateful<gpui::Div> {
         let id = id.into();
+        let colors = *self.colors();
 
         div()
             .id(id)
@@ -312,10 +469,13 @@ impl TempoApp {
             .py_1()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x30323a))
-            .bg(rgb(0x1b1c22))
-            .text_color(rgb(0xc9ccd4))
-            .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+            .border_color(rgb(colors.waveform_border))
+            .bg(rgb(colors.button))
+            .text_color(rgb(colors.text))
+            .hover(move |this| {
+                this.bg(rgb(colors.button_hover))
+                    .text_color(rgb(colors.text_strong))
+            })
             .active(|this| this.opacity(0.82))
             .child(label)
     }

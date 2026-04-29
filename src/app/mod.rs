@@ -31,8 +31,10 @@ mod search;
 mod settings;
 mod sidebar;
 mod table;
+mod theme;
 
 use crate::{FocusSearch, MoveSelectionDown, MoveSelectionUp, NewTab, PlaySelected, TogglePause};
+use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -284,10 +286,24 @@ impl BrowseTab {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct AppState {
+    #[serde(default)]
     library_roots: Vec<PathBuf>,
+    #[serde(default)]
     playlists: Vec<Playlist>,
+    #[serde(default = "default_theme_id")]
+    theme_id: String,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            library_roots: Vec::new(),
+            playlists: Vec::new(),
+            theme_id: default_theme_id(),
+        }
+    }
 }
 
 const INDEX_COL_W: f32 = 34.0;
@@ -335,6 +351,8 @@ pub(crate) struct TempoApp {
     waveform_loading: Vec<bool>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
+    theme_id: String,
+    themes: Vec<Theme>,
     library_root_label: String,
     library_status: String,
     playback_status: String,
@@ -355,6 +373,8 @@ impl TempoApp {
         let search_focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
         let state = Self::load_app_state();
+        let themes = bundled_themes();
+        let theme_id = resolve_theme_id(state.theme_id, &themes);
         let roots = Self::default_library_roots(&state.library_roots);
         let library_root_label = Self::library_root_label(&roots);
         let (event_tx, event_rx) = mpsc::channel();
@@ -391,6 +411,8 @@ impl TempoApp {
             waveform_loading: Vec::new(),
             library_roots: roots,
             playlists,
+            theme_id,
+            themes,
             library_root_label,
             library_status,
             playback_status,
@@ -458,6 +480,25 @@ impl TempoApp {
             page
         };
         self.context_menu_track = None;
+    }
+
+    fn theme(&self) -> &Theme {
+        self.themes
+            .iter()
+            .find(|theme| theme.id == self.theme_id)
+            .or_else(|| self.themes.first())
+            .expect("at least one theme is always available")
+    }
+
+    fn colors(&self) -> &ThemeColors {
+        &self.theme().colors
+    }
+
+    fn set_theme(&mut self, theme_id: &str) {
+        if self.themes.iter().any(|theme| theme.id == theme_id) {
+            self.theme_id = theme_id.to_string();
+            self.save_app_state();
+        }
     }
 
     fn active_tab(&self) -> &BrowseTab {
@@ -616,6 +657,8 @@ fn format_duration(duration: Duration) -> String {
 
 impl Render for TempoApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = self.colors();
+
         div()
             .id("tempo-app")
             .track_focus(&self.focus_handle)
@@ -627,8 +670,8 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::focus_search))
             .on_key_down(cx.listener(Self::handle_table_key_down))
             .size_full()
-            .bg(rgb(0x111216))
-            .text_color(rgb(0xd8d8dd))
+            .bg(rgb(colors.app))
+            .text_color(rgb(colors.text))
             .font_family("Inter")
             .text_sm()
             .flex()

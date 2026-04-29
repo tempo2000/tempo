@@ -1,54 +1,62 @@
 use super::*;
 
 impl TempoApp {
-    pub(super) fn album_tile(track: &Track, size: f32) -> AnyElement {
+    pub(super) fn album_tile(&self, track: &Track, size: f32) -> AnyElement {
         let initials = track.album_initials.clone();
         let color = track.album_color;
         let fallback_initials = initials.clone();
+        let colors = *self.colors();
 
         div()
             .w(px(size))
             .h(px(size))
             .rounded_sm()
             .border_1()
-            .border_color(rgb(0x3a3d45))
+            .border_color(rgb(colors.border_strong))
             .overflow_hidden()
             .child(match &track.artwork {
                 Some(TrackArtwork::Embedded(image)) => img(image.clone())
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color)
+                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
                     })
                     .into_any_element(),
                 Some(TrackArtwork::File(path)) => img(path.clone())
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color)
+                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
                     })
                     .into_any_element(),
-                None => Self::album_tile_fallback(initials, color),
+                None => Self::album_tile_fallback(initials, color, colors),
             })
             .into_any_element()
     }
 
-    pub(super) fn album_tile_placeholder(track: &Track, size: f32) -> AnyElement {
+    pub(super) fn album_tile_placeholder(&self, track: &Track, size: f32) -> AnyElement {
+        let colors = *self.colors();
+
         div()
             .w(px(size))
             .h(px(size))
             .rounded_sm()
             .border_1()
-            .border_color(rgb(0x3a3d45))
+            .border_color(rgb(colors.border_strong))
             .overflow_hidden()
             .child(Self::album_tile_fallback(
                 track.album_initials.clone(),
                 track.album_color,
+                colors,
             ))
             .into_any_element()
     }
 
-    pub(super) fn album_tile_fallback(initials: String, color: u32) -> AnyElement {
+    pub(super) fn album_tile_fallback(
+        initials: String,
+        color: u32,
+        colors: ThemeColors,
+    ) -> AnyElement {
         div()
             .size_full()
             .bg(rgb(color))
@@ -56,7 +64,7 @@ impl TempoApp {
             .items_center()
             .justify_center()
             .text_xs()
-            .text_color(rgb(0xf4f0ea))
+            .text_color(rgb(colors.album_tile_text))
             .child(initials)
             .into_any_element()
     }

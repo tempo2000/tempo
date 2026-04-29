@@ -412,6 +412,8 @@ impl TempoApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let colors = *self.colors();
+
         if self.tracks.is_empty() {
             return div()
                 .h(px(86.0))
@@ -421,20 +423,20 @@ impl TempoApp {
                 .gap_4()
                 .px_4()
                 .border_t_1()
-                .border_color(rgb(0x282a30))
-                .bg(rgb(0x18191e))
+                .border_color(rgb(colors.button_hover))
+                .bg(rgb(colors.player))
                 .child(
                     div()
                         .w(px(54.0))
                         .h(px(54.0))
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(0x3a3d45))
-                        .bg(rgb(0x25262c))
+                        .border_color(rgb(colors.border_strong))
+                        .bg(rgb(colors.playing))
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(rgb(0x777b84))
+                        .text_color(rgb(colors.text_faint))
                         .child("♪"),
                 )
                 .child(
@@ -445,7 +447,7 @@ impl TempoApp {
                         .child(
                             div()
                                 .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0xf0f0f4))
+                                .text_color(rgb(colors.text_strong))
                                 .child(if self.is_scanning {
                                     "Scanning library"
                                 } else {
@@ -454,7 +456,7 @@ impl TempoApp {
                         )
                         .child(
                             div()
-                                .text_color(rgb(0x9a9ea8))
+                                .text_color(rgb(colors.text_muted))
                                 .child(self.visible_scan_status()),
                         ),
                 )
@@ -483,9 +485,9 @@ impl TempoApp {
             .gap_4()
             .px_4()
             .border_t_1()
-            .border_color(rgb(0x282a30))
-            .bg(rgb(0x18191e))
-            .child(Self::album_tile(track, 54.0))
+            .border_color(rgb(colors.button_hover))
+            .bg(rgb(colors.player))
+            .child(self.album_tile(track, 54.0))
             .child(
                 div()
                     .w(px(220.0))
@@ -495,28 +497,33 @@ impl TempoApp {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(0xf0f0f4))
+                            .text_color(rgb(colors.text_strong))
                             .child(track.title.clone()),
                     )
                     .child(
                         div()
-                            .text_color(rgb(0x9a9ea8))
+                            .text_color(rgb(colors.text_muted))
                             .child(format!("{} - {}", track.artist, track.album)),
                     )
-                    .child(div().text_xs().text_color(rgb(0x70747d)).child(format!(
-                        "{}  ·  {}  ·  {}  ·  {}",
-                        track.codec,
-                        Self::bitrate_label(track),
-                        track.year,
-                        self.playback_status.clone()
-                    ))),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_faint))
+                            .child(format!(
+                                "{}  ·  {}  ·  {}  ·  {}",
+                                track.codec,
+                                Self::bitrate_label(track),
+                                track.year,
+                                self.playback_status.clone()
+                            )),
+                    ),
             )
             .child(
                 div()
                     .flex_1()
                     .h_full()
                     .relative()
-                    .child(Self::waveform_seekbar(
+                    .child(self.waveform_seekbar(
                         format_duration(playback_position),
                         track.duration.clone(),
                         playback_progress,
@@ -531,8 +538,8 @@ impl TempoApp {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .text_color(rgb(0xa6aab4))
-                    .child(Self::transport_overlay(self.is_playing, cx))
+                    .text_color(rgb(colors.text_muted))
+                    .child(self.transport_overlay(self.is_playing, cx))
                     .child(
                         div()
                             .flex()
@@ -545,13 +552,13 @@ impl TempoApp {
                                     .flex_1()
                                     .h(px(3.0))
                                     .rounded_full()
-                                    .bg(rgb(0x777b84))
+                                    .bg(rgb(colors.text_faint))
                                     .child(
                                         div()
                                             .w(px(104.0))
                                             .h(px(3.0))
                                             .rounded_full()
-                                            .bg(rgb(0xd8d8dd)),
+                                            .bg(rgb(colors.text)),
                                     ),
                             ),
                     ),
@@ -567,6 +574,7 @@ impl TempoApp {
     }
 
     pub(super) fn waveform_seekbar(
+        &self,
         elapsed: String,
         duration: String,
         progress: f32,
@@ -575,6 +583,7 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let progress_segments = (waveform.len() as f32 * progress).round() as usize;
+        let colors = *self.colors();
 
         div()
             .id("waveform-seekbar")
@@ -586,9 +595,9 @@ impl TempoApp {
             .cursor_pointer()
             .rounded_lg()
             .overflow_hidden()
-            .bg(rgb(0x111218))
+            .bg(rgb(colors.waveform_bg))
             .border_1()
-            .border_color(rgb(0x30323a))
+            .border_color(rgb(colors.waveform_border))
             .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                 if event.standard_click() {
                     let click_x = f32::from(event.position().x);
@@ -604,7 +613,7 @@ impl TempoApp {
                     .left_0()
                     .right_0()
                     .h(px(1.0))
-                    .bg(rgb(0x242833)),
+                    .bg(rgb(colors.waveform_line)),
             )
             .child(
                 div()
@@ -618,7 +627,7 @@ impl TempoApp {
                     .items_center()
                     .gap(px(1.0))
                     .children(waveform.into_iter().enumerate().map(move |(ix, height)| {
-                        Self::waveform_bar(ix, height, progress_segments, loading)
+                        Self::waveform_bar(ix, height, progress_segments, loading, colors)
                     })),
             )
             .when(loading, |this| {
@@ -630,9 +639,9 @@ impl TempoApp {
                         .px_2()
                         .py_1()
                         .rounded_sm()
-                        .bg(rgb(0x111218))
+                        .bg(rgb(colors.waveform_bg))
                         .text_xs()
-                        .text_color(rgb(0x9bbdff))
+                        .text_color(rgb(colors.waveform_played_peak))
                         .child("Loading waveform"),
                 )
             })
@@ -643,9 +652,9 @@ impl TempoApp {
                     .left_3()
                     .px_1()
                     .rounded_sm()
-                    .bg(rgb(0x111218))
+                    .bg(rgb(colors.waveform_bg))
                     .text_xs()
-                    .text_color(rgb(0x777b84))
+                    .text_color(rgb(colors.text_faint))
                     .child(elapsed),
             )
             .child(
@@ -655,9 +664,9 @@ impl TempoApp {
                     .right_3()
                     .px_1()
                     .rounded_sm()
-                    .bg(rgb(0x111218))
+                    .bg(rgb(colors.waveform_bg))
                     .text_xs()
-                    .text_color(rgb(0x777b84))
+                    .text_color(rgb(colors.text_faint))
                     .child(duration),
             )
     }
@@ -667,24 +676,25 @@ impl TempoApp {
         height: f32,
         progress_segments: usize,
         loading: bool,
+        colors: ThemeColors,
     ) -> impl IntoElement {
         let played = ix < progress_segments;
         let playhead = ix == progress_segments;
         let peak = height > 44.0;
         let color = if loading && peak {
-            0x6f9dff
+            colors.waveform_played
         } else if loading {
-            0x444a58
+            colors.waveform_idle_peak
         } else if playhead {
-            0xd7e5ff
+            colors.waveform_playhead
         } else if played && peak {
-            0x9bbdff
+            colors.waveform_played_peak
         } else if played {
-            0x6f9dff
+            colors.waveform_played
         } else if peak {
-            0x555b69
+            colors.waveform_idle_peak
         } else {
-            0x383d49
+            colors.waveform_idle
         };
 
         div()
@@ -701,9 +711,12 @@ impl TempoApp {
     }
 
     pub(super) fn transport_overlay(
+        &self,
         is_playing: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .relative()
             .flex()
@@ -713,41 +726,52 @@ impl TempoApp {
             .px_2()
             .py_1()
             .rounded_full()
-            .bg(rgb(0x111216))
+            .bg(rgb(colors.app))
             .border_1()
-            .border_color(rgb(0x30323a))
-            .child(Self::transport_button("⌘", false))
+            .border_color(rgb(colors.waveform_border))
+            .child(self.transport_button("⌘", false))
             .child(
-                Self::transport_button("◀", false).on_click(cx.listener(|this, _, _, cx| {
-                    this.play_adjacent_track(-1);
-                    cx.notify();
-                })),
+                self.transport_button("◀", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.play_adjacent_track(-1);
+                        cx.notify();
+                    })),
             )
             .child(
-                Self::transport_button(if is_playing { "Ⅱ" } else { "▶" }, true).on_click(
-                    cx.listener(|this, _, _, cx| {
+                self.transport_button(if is_playing { "Ⅱ" } else { "▶" }, true)
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.toggle_playback();
                         cx.notify();
-                    }),
-                ),
+                    })),
             )
             .child(
-                Self::transport_button("▶", false).on_click(cx.listener(|this, _, _, cx| {
-                    this.play_adjacent_track(1);
-                    cx.notify();
-                })),
+                self.transport_button("▶", false)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.play_adjacent_track(1);
+                        cx.notify();
+                    })),
             )
-            .child(Self::transport_button("↻", false))
+            .child(self.transport_button("↻", false))
     }
 
     pub(super) fn transport_button(
+        &self,
         label: &'static str,
         primary: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let size = if primary { 28.0 } else { 22.0 };
         let hover_size = if primary { 32.0 } else { 26.0 };
-        let bg = if primary { 0xe7e7ea } else { 0x18191e };
-        let fg = if primary { 0x111216 } else { 0x9a9ea8 };
+        let colors = *self.colors();
+        let bg = if primary {
+            colors.transport_primary_bg
+        } else {
+            colors.player
+        };
+        let fg = if primary {
+            colors.transport_primary_fg
+        } else {
+            colors.text_muted
+        };
 
         div()
             .id(SharedString::from(format!("transport-{label}-{primary}")))
@@ -765,8 +789,8 @@ impl TempoApp {
             .hover(move |this| {
                 this.w(px(hover_size))
                     .h(px(hover_size))
-                    .bg(rgb(0xf0f0f4))
-                    .text_color(rgb(0x111216))
+                    .bg(rgb(colors.text_strong))
+                    .text_color(rgb(colors.app))
             })
             .child(label)
     }

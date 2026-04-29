@@ -15,13 +15,15 @@ impl TempoApp {
     }
 
     pub(super) fn render_library(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
         div()
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .relative()
-            .bg(rgb(0x131419))
+            .bg(rgb(colors.surface))
             .child(self.render_library_header(cx))
             .when(self.tabs.len() > 1, |this| {
                 this.child(self.render_tab_bar(cx))
@@ -34,13 +36,15 @@ impl TempoApp {
     }
 
     pub(super) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .h(px(34.0))
             .flex_none()
             .px_3()
             .border_b_1()
-            .border_color(rgb(0x24252b))
-            .bg(rgb(0x111216))
+            .border_color(rgb(colors.border))
+            .bg(rgb(colors.app))
             .flex()
             .items_end()
             .gap_1()
@@ -58,9 +62,9 @@ impl TempoApp {
                     .h(px(22.0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x30323a))
-                    .bg(rgb(0x18191f))
-                    .text_color(rgb(0x9a9ea8))
+                    .border_color(rgb(colors.waveform_border))
+                    .bg(rgb(colors.button))
+                    .text_color(rgb(colors.text_muted))
                     .cursor_pointer()
                     .flex()
                     .items_center()
@@ -81,9 +85,22 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let active = ix == self.active_tab;
-        let bg = if active { 0x1b1c22 } else { 0x15161a };
-        let fg = if active { 0xf0f0f4 } else { 0x9a9ea8 };
-        let border = if active { 0x3a3d45 } else { 0x24252b };
+        let colors = *self.colors();
+        let bg = if active {
+            colors.elevated
+        } else {
+            colors.panel_alt
+        };
+        let fg = if active {
+            colors.text_strong
+        } else {
+            colors.text_muted
+        };
+        let border = if active {
+            colors.border_strong
+        } else {
+            colors.border
+        };
 
         div()
             .id(SharedString::from(format!("browse-tab-{ix}")))
@@ -109,7 +126,12 @@ impl TempoApp {
                     .child(self.tab_title(tab)),
             )
             .when(!tab.search_query.trim().is_empty(), |this| {
-                this.child(div().text_xs().text_color(rgb(0xeeb17d)).child("search"))
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(colors.accent))
+                        .child("search"),
+                )
             })
             .when(self.tabs.len() > 1, |this| {
                 this.child(
@@ -122,8 +144,11 @@ impl TempoApp {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_color(rgb(0x777b84))
-                        .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+                        .text_color(rgb(colors.text_faint))
+                        .hover(move |this| {
+                            this.bg(rgb(colors.button_hover))
+                                .text_color(rgb(colors.text_strong))
+                        })
                         .child("x")
                         .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             this.close_tab(ix);
@@ -152,6 +177,8 @@ impl TempoApp {
     }
 
     pub(super) fn render_library_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = *self.colors();
+
         div()
             .h(px(54.0))
             .flex_none()
@@ -160,14 +187,14 @@ impl TempoApp {
             .gap_4()
             .px_4()
             .border_b_1()
-            .border_color(rgb(0x24252b))
+            .border_color(rgb(colors.border))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .when(self.left_sidebar_collapsed, |this| {
-                        this.child(Self::sidebar_button("›", "open-left-sidebar").on_click(
+                        this.child(self.sidebar_button("›", "open-left-sidebar").on_click(
                             cx.listener(|this, _, _, cx| {
                                 this.left_sidebar_collapsed = false;
                                 cx.notify();
@@ -177,7 +204,7 @@ impl TempoApp {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(0xf0f0f4))
+                            .text_color(rgb(colors.text_strong))
                             .child(self.tab_title(self.active_tab())),
                     ),
             )
@@ -190,16 +217,16 @@ impl TempoApp {
                     .h(px(26.0))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x30323a))
-                    .bg(rgb(0x18191f))
+                    .border_color(rgb(colors.waveform_border))
+                    .bg(rgb(colors.button))
                     .px_3()
                     .flex()
                     .items_center()
                     .text_xs()
                     .text_color(rgb(if self.active_search_query().is_empty() {
-                        0x737781
+                        colors.text_faint
                     } else {
-                        0xd8d8dd
+                        colors.text
                     }))
                     .track_focus(&self.search_focus_handle)
                     .on_click(cx.listener(|this, _, window, _cx| {
@@ -215,17 +242,16 @@ impl TempoApp {
                     }),
             )
             .child(
-                Self::sidebar_button("⚙", "open-settings").on_click(cx.listener(
-                    |this, _, _, cx| {
+                self.sidebar_button("⚙", "open-settings")
+                    .on_click(cx.listener(|this, _, _, cx| {
                         this.open_page(Page::Settings);
                         cx.notify();
-                    },
-                )),
+                    })),
             )
             .when(
                 self.right_sidebar_collapsed && !self.queue.is_empty(),
                 |this| {
-                    this.child(Self::sidebar_button("‹", "open-right-sidebar").on_click(
+                    this.child(self.sidebar_button("‹", "open-right-sidebar").on_click(
                         cx.listener(|this, _, _, cx| {
                             this.right_sidebar_collapsed = false;
                             cx.notify();
@@ -236,9 +262,15 @@ impl TempoApp {
     }
 
     pub(super) fn render_scan_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .text_xs()
-            .text_color(rgb(if self.is_scanning { 0xeeb17d } else { 0x676b74 }))
+            .text_color(rgb(if self.is_scanning {
+                colors.accent
+            } else {
+                colors.text_faint
+            }))
             .flex()
             .items_center()
             .gap_1()
@@ -260,8 +292,11 @@ impl TempoApp {
                         .rounded_sm()
                         .px_1()
                         .cursor_pointer()
-                        .text_color(rgb(0xeeb17d))
-                        .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf2c693)))
+                        .text_color(rgb(colors.accent))
+                        .hover(move |this| {
+                            this.bg(rgb(colors.button_hover))
+                                .text_color(rgb(colors.accent_soft))
+                        })
                         .child(label)
                         .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                             this.show_scan_errors = !this.show_scan_errors;
@@ -276,6 +311,7 @@ impl TempoApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
         let errors = self
             .scan_errors
             .iter()
@@ -285,18 +321,22 @@ impl TempoApp {
                 div()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(0x282a30))
+                    .border_color(rgb(colors.button_hover))
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
-                            .text_color(rgb(0xf0f0f4))
+                            .text_color(rgb(colors.text_strong))
                             .overflow_hidden()
                             .text_ellipsis()
                             .child(error.path.display().to_string()),
                     )
-                    .child(div().text_color(rgb(0xa1a5af)).child(error.message.clone()))
+                    .child(
+                        div()
+                            .text_color(rgb(colors.text_muted))
+                            .child(error.message.clone()),
+                    )
             })
             .collect::<Vec<_>>();
         let hidden_count = self.scan_errors.len().saturating_sub(errors.len());
@@ -309,8 +349,8 @@ impl TempoApp {
             .max_h(px(360.0))
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x343741))
-            .bg(rgb(0x1b1c22))
+            .border_color(rgb(colors.border_strong))
+            .bg(rgb(colors.elevated))
             .shadow_lg()
             .p_3()
             .flex()
@@ -324,24 +364,23 @@ impl TempoApp {
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::BOLD)
-                            .text_color(rgb(0xf0f0f4))
+                            .text_color(rgb(colors.text_strong))
                             .child("Scan errors"),
                     )
                     .child(div().flex_1())
                     .child(
-                        Self::sidebar_button("x", "close-scan-errors").on_click(cx.listener(
-                            |this, _event: &ClickEvent, _window, cx| {
+                        self.sidebar_button("x", "close-scan-errors")
+                            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                                 this.show_scan_errors = false;
                                 cx.stop_propagation();
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     ),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x8a8e97))
+                    .text_color(rgb(colors.text_muted))
                     .child("Most recent errors are shown first."),
             )
             .children(errors)
@@ -350,7 +389,7 @@ impl TempoApp {
                     div()
                         .pt_1()
                         .text_xs()
-                        .text_color(rgb(0x8a8e97))
+                        .text_color(rgb(colors.text_muted))
                         .child(format!("+{hidden_count} older errors")),
                 )
             })

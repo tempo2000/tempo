@@ -481,6 +481,7 @@ impl TempoApp {
                     .child(self.render_table_scrollbar(item_count, cx)),
             )
             .when(self.tracks.is_empty(), |this| {
+                let colors = *self.colors();
                 this.child(
                     div()
                         .absolute()
@@ -489,8 +490,8 @@ impl TempoApp {
                         .right(px(24.0))
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(0x24252b))
-                        .bg(rgb(0x17181e))
+                        .border_color(rgb(colors.border))
+                        .bg(rgb(colors.surface))
                         .p_5()
                         .flex()
                         .flex_col()
@@ -498,17 +499,18 @@ impl TempoApp {
                         .child(
                             div()
                                 .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0xf0f0f4))
+                                .text_color(rgb(colors.text_strong))
                                 .child("No indexed audio yet"),
                         )
                         .child(
                             div()
-                                .text_color(rgb(0x8a8e97))
+                                .text_color(rgb(colors.text_muted))
                                 .child(self.library_status.clone()),
                         ),
                 )
             })
             .when(has_no_search_results, |this| {
+                let colors = *self.colors();
                 this.child(
                     div()
                         .absolute()
@@ -517,8 +519,8 @@ impl TempoApp {
                         .right(px(24.0))
                         .rounded_lg()
                         .border_1()
-                        .border_color(rgb(0x24252b))
-                        .bg(rgb(0x17181e))
+                        .border_color(rgb(colors.border))
+                        .bg(rgb(colors.surface))
                         .p_5()
                         .flex()
                         .flex_col()
@@ -526,12 +528,12 @@ impl TempoApp {
                         .child(
                             div()
                                 .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0xf0f0f4))
+                                .text_color(rgb(colors.text_strong))
                                 .child("No matching tracks"),
                         )
                         .child(
                             div()
-                                .text_color(rgb(0x8a8e97))
+                                .text_color(rgb(colors.text_muted))
                                 .child(format!("No tracks match \"{}\".", active_search_query)),
                         ),
                 )
@@ -575,7 +577,7 @@ impl TempoApp {
             .bottom_0()
             .left_0()
             .overflow_hidden()
-            .bg(rgb(0x131419))
+            .bg(rgb(self.colors().surface))
             .children(rows)
             .into_any_element()
     }
@@ -588,14 +590,19 @@ impl TempoApp {
     ) -> AnyElement {
         let active = track_ix == self.playing_track;
         let selected = track_ix == self.active_selected_track();
+        let colors = *self.colors();
         let bg = if selected {
-            0x30323a
+            colors.selected
         } else if active {
-            0x25262c
+            colors.playing
         } else {
-            0x131419
+            colors.row
         };
-        let title_color = if active { 0xeeb17d } else { 0xe2e2e7 };
+        let title_color = if active {
+            colors.accent
+        } else {
+            colors.text_strong
+        };
 
         div()
             .absolute()
@@ -607,13 +614,13 @@ impl TempoApp {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(rgb(0x202127))
+            .border_color(rgb(colors.row_border))
             .bg(rgb(bg))
             .child(
                 div()
                     .w(px(self.column_width(TableColumn::Index)))
                     .text_xs()
-                    .text_color(rgb(0x6d717a))
+                    .text_color(rgb(colors.text_faint))
                     .child(if active {
                         if self.is_playing { "Ⅱ" } else { "▶" }.into()
                     } else {
@@ -625,7 +632,7 @@ impl TempoApp {
                     .w(px(self.column_width(TableColumn::Artwork)))
                     .flex()
                     .items_center()
-                    .child(Self::album_tile_placeholder(track, 22.0)),
+                    .child(self.album_tile_placeholder(track, 22.0)),
             )
             .child(
                 div()
@@ -637,26 +644,17 @@ impl TempoApp {
                     .text_color(rgb(title_color))
                     .child(track.title.clone()),
             )
-            .child(Self::cell(
-                track.album.clone(),
-                self.column_width(TableColumn::Album),
-            ))
-            .child(Self::cell(
-                track.codec.clone(),
-                self.column_width(TableColumn::Format),
-            ))
-            .child(Self::cell(
-                track.plays.clone(),
-                self.column_width(TableColumn::Plays),
-            ))
-            .child(Self::cell(
+            .child(self.cell(track.album.clone(), self.column_width(TableColumn::Album)))
+            .child(self.cell(track.codec.clone(), self.column_width(TableColumn::Format)))
+            .child(self.cell(track.plays.clone(), self.column_width(TableColumn::Plays)))
+            .child(self.cell(
                 track.duration.clone(),
                 self.column_width(TableColumn::Duration),
             ))
             .child(
                 div()
                     .w(px(self.column_width(TableColumn::Loved)))
-                    .text_color(rgb(0xf0b282))
+                    .text_color(rgb(colors.love))
                     .child(if track.loved { "♥" } else { "" }),
             )
             .into_any_element()
@@ -670,6 +668,7 @@ impl TempoApp {
         if item_count == 0 {
             return div().into_any_element();
         }
+        let colors = *self.colors();
 
         let metrics = self.table_scrollbar_metrics();
         let thumb_top = metrics.map_or(0.0, |metrics| metrics.thumb_top);
@@ -712,7 +711,7 @@ impl TempoApp {
                         .items_center()
                         .justify_end()
                         .text_xs()
-                        .text_color(rgb(0x6f7480))
+                        .text_color(rgb(colors.text_faint))
                         .child(marker.label.clone())
                         .into_any_element(),
                 )
@@ -765,7 +764,7 @@ impl TempoApp {
                     .bottom(px(TABLE_SCROLLBAR_MARGIN))
                     .w(px(TABLE_SCROLLBAR_TRACK_W))
                     .rounded_full()
-                    .bg(rgb(0x1d1f26))
+                    .bg(rgb(colors.elevated))
                     .opacity(if scrollable { 0.95 } else { 0.45 })
                     .child(
                         div()
@@ -776,9 +775,9 @@ impl TempoApp {
                             .h(px(thumb_height))
                             .rounded_full()
                             .bg(rgb(if self.table_scrollbar_drag.is_some() {
-                                0xb2b8c4
+                                colors.text
                             } else {
-                                0x767b86
+                                colors.text_faint
                             })),
                     ),
             )
@@ -793,14 +792,14 @@ impl TempoApp {
                             .h(px(18.0))
                             .px_1()
                             .rounded_sm()
-                            .bg(rgb(0x252832))
+                            .bg(rgb(colors.playing))
                             .border_1()
-                            .border_color(rgb(0x3c414d))
+                            .border_color(rgb(colors.border_strong))
                             .flex()
                             .items_center()
                             .justify_center()
                             .text_xs()
-                            .text_color(rgb(0xd3d6df))
+                            .text_color(rgb(colors.text))
                             .overflow_hidden()
                             .child(label),
                     )
@@ -810,16 +809,18 @@ impl TempoApp {
     }
 
     pub(super) fn render_table_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+
         div()
             .h(px(27.0))
             .px_4()
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(rgb(0x24252b))
+            .border_color(rgb(colors.border))
             .text_xs()
             .font_weight(gpui::FontWeight::BOLD)
-            .text_color(rgb(0x5f636c))
+            .text_color(rgb(colors.text_faint))
             .child(self.header_cell("#", TableColumn::Index, Some(SortColumn::Index), cx))
             .child(self.header_cell("", TableColumn::Artwork, None, cx))
             .child(self.header_cell("TITLE", TableColumn::Title, Some(SortColumn::Title), cx))
@@ -845,6 +846,7 @@ impl TempoApp {
         let width = self.column_width(column);
         let tab = self.active_tab();
         let active = sort_column.is_some_and(|column| tab.sort_column == column);
+        let colors = *self.colors();
         let icon = match tab.sort_direction {
             SortDirection::Ascending => "▲",
             SortDirection::Descending => "▼",
@@ -868,10 +870,14 @@ impl TempoApp {
             .flex()
             .items_center()
             .gap_1()
-            .text_color(rgb(if active { 0xc9ccd4 } else { 0x5f636c }))
+            .text_color(rgb(if active {
+                colors.text
+            } else {
+                colors.text_faint
+            }))
             .when(sort_column.is_some(), |this| {
                 this.cursor_pointer()
-                    .hover(|this| this.text_color(rgb(0xc9ccd4)))
+                    .hover(move |this| this.text_color(rgb(colors.text)))
             })
             .child(label)
             .when(active, |this| this.child(icon))
@@ -900,7 +906,7 @@ impl TempoApp {
                     .bottom_0()
                     .w(px(6.0))
                     .cursor(CursorStyle::ResizeColumn)
-                    .hover(|this| this.bg(rgb(0x343741)))
+                    .hover(move |this| this.bg(rgb(colors.border_strong)))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -922,14 +928,19 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let active = track_ix == self.playing_track;
         let selected = track_ix == self.active_selected_track();
+        let colors = *self.colors();
         let bg = if selected {
-            0x30323a
+            colors.selected
         } else if active {
-            0x25262c
+            colors.playing
         } else {
-            0x131419
+            colors.row
         };
-        let title_color = if active { 0xeeb17d } else { 0xe2e2e7 };
+        let title_color = if active {
+            colors.accent
+        } else {
+            colors.text_strong
+        };
 
         div()
             .id(SharedString::from(format!("track-row-{track_ix}")))
@@ -938,11 +949,11 @@ impl TempoApp {
             .flex()
             .items_center()
             .border_b_1()
-            .border_color(rgb(0x202127))
+            .border_color(rgb(colors.row_border))
             .bg(rgb(bg))
             .when(!lightweight, |this| {
                 this.cursor_pointer()
-                    .hover(|this| this.bg(rgb(0x202229)))
+                    .hover(move |this| this.bg(rgb(colors.hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         window.focus(&this.focus_handle);
                         this.set_active_selected_track(track_ix);
@@ -982,7 +993,7 @@ impl TempoApp {
                 div()
                     .w(px(self.column_width(TableColumn::Index)))
                     .text_xs()
-                    .text_color(rgb(0x6d717a))
+                    .text_color(rgb(colors.text_faint))
                     .child(if active {
                         if self.is_playing { "Ⅱ" } else { "▶" }.into()
                     } else {
@@ -995,9 +1006,9 @@ impl TempoApp {
                     .flex()
                     .items_center()
                     .child(if lightweight {
-                        Self::album_tile_placeholder(track, 22.0)
+                        self.album_tile_placeholder(track, 22.0)
                     } else {
-                        Self::album_tile(track, 22.0)
+                        self.album_tile(track, 22.0)
                     }),
             )
             .child(
@@ -1010,36 +1021,27 @@ impl TempoApp {
                     .text_color(rgb(title_color))
                     .child(track.title.clone()),
             )
-            .child(Self::cell(
-                track.album.clone(),
-                self.column_width(TableColumn::Album),
-            ))
-            .child(Self::cell(
-                track.codec.clone(),
-                self.column_width(TableColumn::Format),
-            ))
-            .child(Self::cell(
-                track.plays.clone(),
-                self.column_width(TableColumn::Plays),
-            ))
-            .child(Self::cell(
+            .child(self.cell(track.album.clone(), self.column_width(TableColumn::Album)))
+            .child(self.cell(track.codec.clone(), self.column_width(TableColumn::Format)))
+            .child(self.cell(track.plays.clone(), self.column_width(TableColumn::Plays)))
+            .child(self.cell(
                 track.duration.clone(),
                 self.column_width(TableColumn::Duration),
             ))
             .child(
                 div()
                     .w(px(self.column_width(TableColumn::Loved)))
-                    .text_color(rgb(0xf0b282))
+                    .text_color(rgb(colors.love))
                     .child(if track.loved { "♥" } else { "" }),
             )
     }
 
-    pub(super) fn cell(content: impl Into<SharedString>, width: f32) -> impl IntoElement {
+    pub(super) fn cell(&self, content: impl Into<SharedString>, width: f32) -> impl IntoElement {
         div()
             .w(px(width))
             .overflow_hidden()
             .text_ellipsis()
-            .text_color(rgb(0x8a8e97))
+            .text_color(rgb(self.colors().text_muted))
             .child(content.into())
     }
 
@@ -1050,6 +1052,7 @@ impl TempoApp {
     ) -> impl IntoElement + use<> {
         let track = &self.tracks[track_ix];
         let top = 27.0 + ((self.context_menu_row as f32 + 1.0) * TABLE_ROW_H).min(560.0);
+        let colors = *self.colors();
 
         div()
             .absolute()
@@ -1058,8 +1061,8 @@ impl TempoApp {
             .w(px(190.0))
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x343741))
-            .bg(rgb(0x1b1c22))
+            .border_color(rgb(colors.border_strong))
+            .bg(rgb(colors.elevated))
             .shadow_lg()
             .overflow_hidden()
             .child(
@@ -1067,44 +1070,40 @@ impl TempoApp {
                     .px_3()
                     .py_2()
                     .border_b_1()
-                    .border_color(rgb(0x2b2d35))
+                    .border_color(rgb(colors.border))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(0xf0f0f4))
+                    .text_color(rgb(colors.text_strong))
                     .overflow_hidden()
                     .text_ellipsis()
                     .child(track.title.clone()),
             )
             .child(
-                Self::context_menu_item("Play from start").on_click(cx.listener(
-                    move |this, _, _, cx| {
+                self.context_menu_item("Play from start")
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         if track_ix < this.tracks.len() {
                             this.play_track(track_ix);
                             cx.notify();
                         }
-                    },
-                )),
+                    })),
             )
-            .child(
-                Self::context_menu_item("Add to queue").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.queue_track(track_ix);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(Self::context_menu_item("Queue Album").on_click(cx.listener(
+            .child(self.context_menu_item("Add to queue").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.queue_track(track_ix);
+                    cx.notify();
+                },
+            )))
+            .child(self.context_menu_item("Queue Album").on_click(cx.listener(
                 move |this, _, _, cx| {
                     this.queue_album_from_track(track_ix, false);
                     cx.notify();
                 },
             )))
             .child(
-                Self::context_menu_item("Queue Album Shuffled").on_click(cx.listener(
-                    move |this, _, _, cx| {
+                self.context_menu_item("Queue Album Shuffled")
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.queue_album_from_track(track_ix, true);
                         cx.notify();
-                    },
-                )),
+                    })),
             )
             .when(!self.playlists.is_empty(), |this| {
                 this.child(
@@ -1114,10 +1113,10 @@ impl TempoApp {
                         .pt_2()
                         .pb_1()
                         .border_t_1()
-                        .border_color(rgb(0x2b2d35))
+                        .border_color(rgb(colors.border))
                         .text_xs()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(0x777b84))
+                        .text_color(rgb(colors.text_faint))
                         .child("ADD TO PLAYLIST"),
                 )
                 .children(
@@ -1125,7 +1124,7 @@ impl TempoApp {
                         .iter()
                         .enumerate()
                         .map(|(playlist_ix, playlist)| {
-                            Self::context_menu_item_dynamic(format!("Add to {}", playlist.name))
+                            self.context_menu_item_dynamic(format!("Add to {}", playlist.name))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.add_track_to_playlist(track_ix, playlist_ix);
                                     cx.notify();
@@ -1133,11 +1132,13 @@ impl TempoApp {
                         }),
                 )
             })
-            .child(Self::context_menu_item("Go to album"))
-            .child(Self::context_menu_item("Show file"))
+            .child(self.context_menu_item("Go to album"))
+            .child(self.context_menu_item("Show file"))
     }
 
-    pub(super) fn context_menu_item(label: &'static str) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn context_menu_item(&self, label: &'static str) -> gpui::Stateful<gpui::Div> {
+        let colors = *self.colors();
+
         div()
             .id(SharedString::from(format!("context-menu-{label}")))
             .h(px(28.0))
@@ -1145,13 +1146,17 @@ impl TempoApp {
             .flex()
             .items_center()
             .cursor_pointer()
-            .text_color(rgb(0xc9ccd4))
-            .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+            .text_color(rgb(colors.text))
+            .hover(move |this| {
+                this.bg(rgb(colors.button_hover))
+                    .text_color(rgb(colors.text_strong))
+            })
             .child(label)
     }
 
-    pub(super) fn context_menu_item_dynamic(label: String) -> gpui::Stateful<gpui::Div> {
+    pub(super) fn context_menu_item_dynamic(&self, label: String) -> gpui::Stateful<gpui::Div> {
         let id = SharedString::from(format!("context-menu-{label}"));
+        let colors = *self.colors();
 
         div()
             .id(id)
@@ -1160,8 +1165,11 @@ impl TempoApp {
             .flex()
             .items_center()
             .cursor_pointer()
-            .text_color(rgb(0xc9ccd4))
-            .hover(|this| this.bg(rgb(0x282a30)).text_color(rgb(0xf0f0f4)))
+            .text_color(rgb(colors.text))
+            .hover(move |this| {
+                this.bg(rgb(colors.button_hover))
+                    .text_color(rgb(colors.text_strong))
+            })
             .child(label)
     }
 }
