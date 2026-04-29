@@ -465,6 +465,73 @@ impl TempoApp {
     }
 
     pub(super) fn decode_waveform(track: &WaveformSource) -> Option<Vec<f32>> {
+        Self::decode_waveform_sampled(track).or_else(|| Self::decode_waveform_full(track))
+    }
+
+    pub(super) fn decode_waveform_sampled(track: &WaveformSource) -> Option<Vec<f32>> {
+        let file = fs::File::open(&track.path).ok()?;
+        let file_size = file.metadata().ok()?.len();
+        let mut builder = Decoder::builder()
+            .with_data(file)
+            .with_byte_len(file_size)
+            .with_seekable(true)
+            .with_coarse_seek(true)
+            .with_gapless(false);
+
+        if let Some(extension) = track
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
+            builder = builder.with_hint(extension);
+        }
+
+        let mut decoder = builder.build().ok()?;
+        let duration = decoder.total_duration().unwrap_or(track.duration_value);
+
+        if duration < WAVEFORM_SAMPLED_MIN_DURATION {
+            return None;
+        }
+
+        let sample_rate = decoder.sample_rate().get() as usize;
+        let channels = decoder.channels().get() as usize;
+        let total_samples = (duration.as_secs_f64() * sample_rate as f64 * channels as f64)
+            .ceil()
+            .max(1.0) as usize;
+        let samples_per_bin = (total_samples / WAVEFORM_SEGMENTS).max(1);
+        let sample_window = (samples_per_bin / 10).clamp(
+            WAVEFORM_MIN_SAMPLE_FRAMES * channels,
+            WAVEFORM_MAX_SAMPLE_FRAMES * channels,
+        );
+        let segment_seconds = duration.as_secs_f64() / WAVEFORM_SEGMENTS as f64;
+
+        if !segment_seconds.is_finite() || segment_seconds <= 0.0 {
+            return None;
+        }
+
+        let mut peaks = vec![0.0_f32; WAVEFORM_SEGMENTS];
+        let mut saw_sample = false;
+
+        for (segment, peak) in peaks.iter_mut().enumerate() {
+            if segment > 0 {
+                let target = Duration::from_secs_f64(segment_seconds * segment as f64);
+                decoder.try_seek(target).ok()?;
+            }
+
+            for _ in 0..sample_window {
+                let Some(sample) = decoder.next() else {
+                    break;
+                };
+
+                *peak = peak.max(sample.abs());
+                saw_sample = true;
+            }
+        }
+
+        saw_sample.then(|| Self::normalize_waveform_peaks(peaks))
+    }
+
+    pub(super) fn decode_waveform_full(track: &WaveformSource) -> Option<Vec<f32>> {
         let file = fs::File::open(&track.path).ok()?;
         let mut decoder = Decoder::try_from(file).ok()?;
         let duration = decoder.total_duration().unwrap_or(track.duration_value);
@@ -498,13 +565,15 @@ impl TempoApp {
             return None;
         }
 
+        Some(Self::normalize_waveform_peaks(peaks))
+    }
+
+    pub(super) fn normalize_waveform_peaks(peaks: Vec<f32>) -> Vec<f32> {
         let max_peak = peaks.iter().copied().fold(0.0_f32, f32::max).max(0.001);
-        Some(
-            peaks
-                .into_iter()
-                .map(|peak| 8.0 + (peak / max_peak).sqrt() * 50.0)
-                .collect(),
-        )
+        peaks
+            .into_iter()
+            .map(|peak| 8.0 + (peak / max_peak).sqrt() * 50.0)
+            .collect()
     }
 
     pub(super) fn generate_fallback_waveform(track: &WaveformSource) -> Vec<f32> {
