@@ -1,8 +1,9 @@
 use std::{
-    collections::HashSet,
+    cell::RefCell,
+    collections::{HashMap, HashSet},
     env, fs,
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -54,7 +55,7 @@ use crate::{
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
 
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 enum Page {
     Library,
     Artists,
@@ -308,6 +309,12 @@ struct Track {
     artwork: Option<TrackArtwork>,
     album_initials: String,
     album_color: u32,
+    /// Pre-lowercased concatenation of `title`, `artist`, `album`,
+    /// `genre`, `year`, `codec`, and the displayed path. Computed once
+    /// at construction time so search keystrokes don't have to
+    /// `format!() + to_lowercase()` per track per filter rebuild --
+    /// previously the dominant cost on a 50k-track library.
+    searchable_lower: String,
 }
 
 #[derive(Clone)]
@@ -320,6 +327,8 @@ struct Artist {
     track_count: usize,
     initials: String,
     color: u32,
+    /// Pre-lowercased searchable blob; see `Track::searchable_lower`.
+    searchable_lower: String,
 }
 
 #[derive(Clone)]
@@ -333,6 +342,8 @@ struct Album {
     track_count: usize,
     initials: String,
     color: u32,
+    /// Pre-lowercased searchable blob; see `Track::searchable_lower`.
+    searchable_lower: String,
 }
 
 #[derive(Default)]
@@ -488,6 +499,21 @@ impl Render for TrackDrag {
 struct Playlist {
     name: String,
     track_paths: Vec<PathBuf>,
+}
+
+/// Right-click menu state for a sidebar playlist nav item.
+#[derive(Clone, Copy)]
+struct PlaylistContextMenu {
+    playlist_ix: usize,
+    position: Point<Pixels>,
+}
+
+/// Inline-rename state for a sidebar playlist nav item. Holds the
+/// editing buffer; the focus handle lives on `TempoApp` so it survives
+/// across re-renders.
+struct PlaylistRename {
+    playlist_ix: usize,
+    input: TextInputState,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -786,6 +812,37 @@ fn default_visible_table_columns() -> Vec<TableColumn> {
     ]
 }
 
+/// Memoized output of `artist_indices_for_search_query` /
+/// `album_indices_for_search_query`. The cache stores both the filtered
+/// index list and a "generation" stamp so the consumer can also derive
+/// scrollbar marker labels without recomputing the filter.
+#[derive(Default)]
+pub(crate) struct BrowseFilterCache {
+    /// `(query, source_generation)` that produced `indices`. `None`
+    /// means the cache has never been populated; any new query or
+    /// mutation of the source `Vec` invalidates the entry.
+    key: Option<(String, u64)>,
+    indices: Vec<usize>,
+}
+
+impl BrowseFilterCache {
+    fn invalidate(&mut self) {
+        self.key = None;
+        self.indices.clear();
+    }
+}
+
+/// Build the `path -> index` reverse map from a fresh tracks slice.
+/// Reused by the constructor and by every code path that bulk-replaces
+/// `self.tracks` (full library reload, post-scan refresh, etc).
+fn build_track_path_index(tracks: &[Track]) -> HashMap<PathBuf, usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(ix, track)| (track.path.clone(), ix))
+        .collect()
+}
+
 fn old_default_visible_table_columns() -> Vec<TableColumn> {
     vec![
         TableColumn::Index,
@@ -897,9 +954,50 @@ pub(crate) struct TempoApp {
     playback_mode: PlaybackMode,
     context_menu_track: Option<usize>,
     context_menu_position: Point<Pixels>,
+    /// Right-click context menu state for sidebar playlist nav items.
+    /// `None` means no menu is open. The position is the mouse-down
+    /// location at the moment of the right-click; the menu anchors there.
+    playlist_context_menu: Option<PlaylistContextMenu>,
+    /// Inline rename state for a sidebar playlist. While `Some`, the
+    /// playlist nav item swaps its label for an editable input bound to
+    /// `rename_input`. Enter commits, Escape cancels, click-away cancels.
+    playlist_rename: Option<PlaylistRename>,
+    /// Single-shot focus handle for the rename input. Re-created when a
+    /// rename starts; dropped when it ends.
+    playlist_rename_focus_handle: Option<FocusHandle>,
+    /// Delete-playlist confirmation modal state. `Some(playlist_ix)`
+    /// shows a centered dialog asking for confirmation; `None` means no
+    /// dialog is open.
+    playlist_delete_confirm: Option<usize>,
     tracks: Vec<Track>,
+    /// Reverse-index from `Track::path` to its position in `tracks`.
+    /// Used by the scanner to upsert known tracks in O(1) instead of
+    /// O(N) -- a hot path during cold scans of large libraries.
+    /// Always kept in sync with `tracks` via `Self::rebuild_track_path_index`
+    /// or the in-place `track_path_index_*` helpers.
+    track_path_index: HashMap<PathBuf, usize>,
+    /// Cached sum of `Track::file_size` over all entries in `tracks`.
+    /// Maintained incrementally so the sidebar footer can render the
+    /// "12.3 GB" label without iterating the full track list every
+    /// frame. Always equals `tracks.iter().map(|t| t.file_size).sum()`.
+    library_size_bytes: u64,
     artists: Vec<Artist>,
     albums: Vec<Album>,
+    /// Bumped whenever `self.artists` is reassigned. Used as a cache
+    /// generation token by `artist_filter_cache` so a new artist load
+    /// invalidates any memoized filter result without us needing to
+    /// touch the cache directly from every mutation site.
+    artists_generation: u64,
+    /// Bumped whenever `self.albums` is reassigned.
+    albums_generation: u64,
+    /// Memoized filter results for the Browse pages. Key is the
+    /// `browse_search_query` at the time of computation; if the query
+    /// hasn't changed and `artists` hasn't been mutated, the cached
+    /// indices are reused on every repaint instead of being recomputed
+    /// up to three times per frame (artists grid + scrollbar markers +
+    /// floating drag label).
+    artist_filter_cache: RefCell<BrowseFilterCache>,
+    album_filter_cache: RefCell<BrowseFilterCache>,
     artist_view_mode: BrowseViewMode,
     album_view_mode: BrowseViewMode,
     queue: Vec<usize>,
@@ -1053,7 +1151,10 @@ impl TempoApp {
         let album_table_scroll_top = state.album_table_scroll_top;
         let save_on_quit = cx.on_app_quit(|app, _cx| {
             perf::event("shutdown.app_quit", "saving_state");
-            perf::time("shutdown.save_app_state", "", || app.save_app_state());
+            // Synchronous save at shutdown so the latest state is always
+            // flushed even if the debounce window for the background save
+            // thread hadn't elapsed yet.
+            perf::time("shutdown.save_app_state", "", || app.save_app_state_now());
             async {}
         });
 
@@ -1092,9 +1193,19 @@ impl TempoApp {
             playback_mode: PlaybackMode::Straight,
             context_menu_track: None,
             context_menu_position: Point::default(),
+            playlist_context_menu: None,
+            playlist_rename: None,
+            playlist_rename_focus_handle: None,
+            playlist_delete_confirm: None,
+            track_path_index: build_track_path_index(&cached_tracks),
+            library_size_bytes: cached_tracks.iter().map(|track| track.file_size).sum(),
             tracks: cached_tracks,
             artists: cached_artists,
             albums: cached_albums,
+            artists_generation: 0,
+            albums_generation: 0,
+            artist_filter_cache: RefCell::new(BrowseFilterCache::default()),
+            album_filter_cache: RefCell::new(BrowseFilterCache::default()),
             artist_view_mode: state.artist_view_mode,
             album_view_mode: state.album_view_mode,
             queue: Vec::new(),
@@ -1324,6 +1435,278 @@ impl TempoApp {
         self.invalidate_track_indices();
         self.save_app_state();
         self.context_menu_track = None;
+    }
+
+    /// Open the right-click context menu for a sidebar playlist nav
+    /// item at the given screen position. Closes any other open menus
+    /// or rename input to keep the UI in a single state.
+    fn open_playlist_context_menu(&mut self, playlist_ix: usize, position: Point<Pixels>) {
+        if playlist_ix >= self.playlists.len() {
+            return;
+        }
+        self.cancel_playlist_rename();
+        self.context_menu_track = None;
+        self.column_menu_open = false;
+        self.playlist_context_menu = Some(PlaylistContextMenu {
+            playlist_ix,
+            position,
+        });
+    }
+
+    fn close_playlist_context_menu(&mut self) {
+        self.playlist_context_menu = None;
+    }
+
+    /// Begin inline rename of a sidebar playlist. Pre-populates the
+    /// input with the current name and selects it so typing replaces
+    /// the whole name. `window.focus(handle)` runs on the same frame
+    /// so the new input is the active focus target by the time GPUI
+    /// dispatches the next key event.
+    fn start_playlist_rename(
+        &mut self,
+        playlist_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(playlist) = self.playlists.get(playlist_ix) else {
+            return;
+        };
+        let mut input = TextInputState::default();
+        input.set_text(playlist.name.clone());
+        input.select_all();
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle);
+        self.playlist_context_menu = None;
+        self.playlist_delete_confirm = None;
+        self.playlist_rename = Some(PlaylistRename { playlist_ix, input });
+        self.playlist_rename_focus_handle = Some(focus_handle);
+    }
+
+    fn cancel_playlist_rename(&mut self) {
+        self.playlist_rename = None;
+        self.playlist_rename_focus_handle = None;
+    }
+
+    /// Key handler for the inline playlist rename input. Mirrors the
+    /// behaviour of the library search box: Enter commits, Escape
+    /// cancels, arrows/home/end/backspace/delete edit the buffer,
+    /// Cmd/Ctrl+A selects all, Cmd/Ctrl+C/X/V handle clipboard.
+    pub(super) fn handle_playlist_rename_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.keystroke.modifiers;
+        let command = modifiers.control || modifiers.platform;
+
+        let Some(rename) = self.playlist_rename.as_mut() else {
+            return;
+        };
+
+        match event.keystroke.key.as_str() {
+            "enter" => {
+                self.commit_playlist_rename();
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "escape" => {
+                self.cancel_playlist_rename();
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "backspace" => {
+                rename.input.backspace(command);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "delete" => {
+                rename.input.delete(command);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "left" => {
+                rename.input.move_left(command, modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "right" => {
+                rename.input.move_right(command, modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "home" => {
+                rename.input.move_home(modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "end" => {
+                rename.input.move_end(modifiers.shift);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "space" => {
+                if command || modifiers.alt || modifiers.function {
+                    return;
+                }
+                rename.input.insert(" ");
+                cx.stop_propagation();
+                cx.notify();
+            }
+            _ => {
+                if command && !modifiers.alt && !modifiers.function {
+                    match event.keystroke.key.as_str() {
+                        "a" => {
+                            rename.input.select_all();
+                            cx.stop_propagation();
+                            cx.notify();
+                            return;
+                        }
+                        "c" => {
+                            if let Some(text) = rename.input.selected_text() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "x" => {
+                            if let Some(text) = rename.input.selected_text() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                rename.input.insert("");
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        "v" => {
+                            if let Some(text) =
+                                cx.read_from_clipboard().and_then(|item| item.text())
+                            {
+                                rename.input.insert(&text.replace('\n', " "));
+                                cx.notify();
+                            }
+                            cx.stop_propagation();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+
+                let Some(key_char) = event.keystroke.key_char.as_ref() else {
+                    return;
+                };
+                if command || modifiers.alt || modifiers.function {
+                    return;
+                }
+                if key_char.chars().all(|ch| !ch.is_control()) {
+                    rename.input.insert(key_char);
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Apply the in-progress rename. Empty / whitespace-only names are
+    /// rejected (treated as a cancel) so we never end up with an
+    /// invisible playlist label.
+    fn commit_playlist_rename(&mut self) {
+        let Some(rename) = self.playlist_rename.take() else {
+            return;
+        };
+        self.playlist_rename_focus_handle = None;
+        let new_name = rename.input.text().trim().to_string();
+        if new_name.is_empty() {
+            return;
+        }
+        let Some(playlist) = self.playlists.get_mut(rename.playlist_ix) else {
+            return;
+        };
+        if playlist.name == new_name {
+            return;
+        }
+        playlist.name = new_name;
+        self.save_app_state();
+    }
+
+    /// Show the delete-confirmation modal for a playlist.
+    fn request_delete_playlist(&mut self, playlist_ix: usize) {
+        if playlist_ix >= self.playlists.len() {
+            return;
+        }
+        self.playlist_context_menu = None;
+        self.cancel_playlist_rename();
+        self.playlist_delete_confirm = Some(playlist_ix);
+    }
+
+    fn cancel_delete_playlist(&mut self) {
+        self.playlist_delete_confirm = None;
+    }
+
+    /// Confirm and perform the playlist deletion. Closes any open tabs
+    /// referencing this playlist and shifts indices in surviving tabs
+    /// + saved state so all `TabSource::Playlist(ix)` references stay
+    /// valid.
+    fn confirm_delete_playlist(&mut self) {
+        let Some(playlist_ix) = self.playlist_delete_confirm.take() else {
+            return;
+        };
+        if playlist_ix >= self.playlists.len() {
+            return;
+        }
+
+        self.playlists.remove(playlist_ix);
+
+        // Drop tabs that pointed at the deleted playlist; for tabs
+        // pointing at a higher index, shift down by 1 to keep them
+        // aligned with the new `playlists` Vec.
+        let mut tab_ix = 0;
+        while tab_ix < self.tabs.len() {
+            match self.tabs[tab_ix].source {
+                TabSource::Playlist(ix) if ix == playlist_ix => {
+                    // Skip the closability check used for normal tab
+                    // close: when the underlying playlist is gone,
+                    // the tab has nothing to render so it must be
+                    // removed even if it's the active tab.
+                    self.tabs.remove(tab_ix);
+                    if self.active_tab > tab_ix {
+                        self.active_tab -= 1;
+                    } else if self.active_tab >= self.tabs.len() {
+                        self.active_tab = self.tabs.len().saturating_sub(1);
+                    }
+                    continue;
+                }
+                TabSource::Playlist(ix) if ix > playlist_ix => {
+                    self.tabs[tab_ix].source = TabSource::Playlist(ix - 1);
+                }
+                _ => {}
+            }
+            tab_ix += 1;
+        }
+
+        // Same shift for navigation history entries -- otherwise
+        // back/forward could resurrect a stale playlist index.
+        for entry in self
+            .back_history
+            .iter_mut()
+            .chain(self.forward_history.iter_mut())
+        {
+            if let Some(tab) = entry.tab.as_mut() {
+                match tab.source {
+                    TabSource::Playlist(ix) if ix == playlist_ix => {
+                        entry.tab = None;
+                    }
+                    TabSource::Playlist(ix) if ix > playlist_ix => {
+                        tab.source = TabSource::Playlist(ix - 1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        self.sync_search_input_to_active_tab();
+        self.context_menu_track = None;
+        self.invalidate_track_indices();
+        self.save_app_state();
     }
 
     fn next_playlist_name(&self) -> String {
@@ -1817,10 +2200,78 @@ impl TempoApp {
     }
 }
 
+/// Build the pre-lowercased searchable blob for a `Track`. Match
+/// arguments mirror the columns the UI search bar previously
+/// `format!()`-ed on every keystroke.
+fn track_searchable_lower(
+    title: &str,
+    artist: &str,
+    album: &str,
+    genre: &str,
+    year: &str,
+    codec: &str,
+    path: &Path,
+) -> String {
+    format!(
+        "{} {} {} {} {} {} {}",
+        title,
+        artist,
+        album,
+        genre,
+        year,
+        codec,
+        path.display()
+    )
+    .to_lowercase()
+}
+
+fn artist_searchable_lower(
+    name: &str,
+    bio: Option<&str>,
+    album_count: usize,
+    track_count: usize,
+) -> String {
+    format!(
+        "{} {} {} {}",
+        name,
+        bio.unwrap_or_default(),
+        album_count,
+        track_count
+    )
+    .to_lowercase()
+}
+
+fn album_searchable_lower(
+    title: &str,
+    artist: &str,
+    year: Option<&str>,
+    track_count: usize,
+) -> String {
+    format!(
+        "{} {} {} {}",
+        title,
+        artist,
+        year.unwrap_or_default(),
+        track_count
+    )
+    .to_lowercase()
+}
+
 impl From<tempo::library::Track> for Track {
     fn from(track: tempo::library::Track) -> Self {
         let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
         let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+        let genre = track.genre.unwrap_or_else(|| "Unknown genre".to_string());
+        let year = track.year.unwrap_or_else(|| "Unknown year".to_string());
+        let searchable_lower = track_searchable_lower(
+            &track.title,
+            &track.artist,
+            &track.album,
+            &genre,
+            &year,
+            &track.codec,
+            &track.path,
+        );
 
         Self {
             artist_id: None,
@@ -1829,9 +2280,9 @@ impl From<tempo::library::Track> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
-            genre: track.genre.unwrap_or_else(|| "Unknown genre".to_string()),
+            genre,
             track_number: track.track_number,
-            year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
+            year,
             date_added: track.date_added,
             duration: format_duration(track.duration),
             duration_value: track.duration,
@@ -1843,6 +2294,7 @@ impl From<tempo::library::Track> for Track {
             artwork: track.artwork.and_then(TrackArtwork::from_library),
             album_initials,
             album_color,
+            searchable_lower,
         }
     }
 }
@@ -1851,6 +2303,17 @@ impl From<CatalogTrack> for Track {
     fn from(track: CatalogTrack) -> Self {
         let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
         let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+        let genre = track.genre.unwrap_or_else(|| "Unknown genre".to_string());
+        let year = track.year.unwrap_or_else(|| "Unknown year".to_string());
+        let searchable_lower = track_searchable_lower(
+            &track.title,
+            &track.artist,
+            &track.album,
+            &genre,
+            &year,
+            &track.codec,
+            &track.path,
+        );
 
         Self {
             artist_id: Some(track.artist_id),
@@ -1859,9 +2322,9 @@ impl From<CatalogTrack> for Track {
             title: track.title,
             artist: track.artist,
             album: track.album,
-            genre: track.genre.unwrap_or_else(|| "Unknown genre".to_string()),
+            genre,
             track_number: track.track_number,
-            year: track.year.unwrap_or_else(|| "Unknown year".to_string()),
+            year,
             date_added: track.date_added,
             duration: format_duration(track.duration),
             duration_value: track.duration,
@@ -1873,12 +2336,19 @@ impl From<CatalogTrack> for Track {
             artwork: track.artwork_path.map(TrackArtwork::File),
             album_initials,
             album_color,
+            searchable_lower,
         }
     }
 }
 
 impl From<CatalogArtist> for Artist {
     fn from(artist: CatalogArtist) -> Self {
+        let searchable_lower = artist_searchable_lower(
+            &artist.name,
+            artist.bio.as_deref(),
+            artist.album_count,
+            artist.track_count,
+        );
         Self {
             artist_id: artist.artist_id,
             initials: TempoApp::initials_for(&artist.name),
@@ -1888,12 +2358,19 @@ impl From<CatalogArtist> for Artist {
             photo_path: artist.photo_path,
             album_count: artist.album_count,
             track_count: artist.track_count,
+            searchable_lower,
         }
     }
 }
 
 impl From<CatalogAlbum> for Album {
     fn from(album: CatalogAlbum) -> Self {
+        let searchable_lower = album_searchable_lower(
+            &album.title,
+            &album.artist,
+            album.year.as_deref(),
+            album.track_count,
+        );
         Self {
             album_id: album.album_id,
             artist_id: album.artist_id,
@@ -1904,6 +2381,7 @@ impl From<CatalogAlbum> for Album {
             year: album.year,
             artwork_path: album.artwork_path,
             track_count: album.track_count,
+            searchable_lower,
         }
     }
 }
@@ -1940,6 +2418,103 @@ fn format_duration(duration: Duration) -> String {
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
     format!("{minutes}:{seconds:02}")
+}
+
+/// Open the OS file manager focused on `path`, ideally with `path`
+/// selected. Falls back to opening the parent directory if a
+/// "select-and-reveal" call isn't available.
+///
+/// Runs the actual platform calls on a short-lived background thread
+/// so the UI thread is never blocked on file-manager startup or
+/// dbus-send round-trips.
+pub(super) fn reveal_in_file_manager(path: &Path) {
+    // The track path may have been removed/renamed on disk between
+    // catalog refresh and the user clicking the menu item; treat that
+    // as a no-op rather than spawning a process for a nonexistent
+    // target.
+    if !path.exists() {
+        perf::event(
+            "reveal_in_file_manager.skip_missing",
+            format!("path={}", path.display()),
+        );
+        return;
+    }
+
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("tempo-reveal-in-file-manager".into())
+        .spawn(move || reveal_in_file_manager_blocking(&path))
+        .ok();
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_in_file_manager_blocking(path: &Path) {
+    // `open -R <path>` reveals + selects the file in Finder.
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status();
+    perf::event(
+        "reveal_in_file_manager.open_dash_r",
+        format!("path={}", path.display()),
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_in_file_manager_blocking(path: &Path) {
+    // `explorer /select,<path>` opens Explorer with the file
+    // highlighted. The comma is part of the option syntax and the
+    // whole thing must be a single argument.
+    let mut arg = std::ffi::OsString::from("/select,");
+    arg.push(path.as_os_str());
+    let _ = std::process::Command::new("explorer").arg(arg).status();
+    perf::event(
+        "reveal_in_file_manager.explorer_select",
+        format!("path={}", path.display()),
+    );
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn reveal_in_file_manager_blocking(path: &Path) {
+    // Try the freedesktop FileManager1 D-Bus interface first --
+    // implemented by Nautilus, Nemo, Caja, Dolphin, PCManFM, and
+    // Thunar (recent versions). When present it selects the file
+    // in a file-manager window instead of just opening the parent
+    // directory.
+    //
+    // Method signature: `ShowItems(as URIs, s startup_id)`. We pass
+    // a single file:// URI and an empty startup id.
+    let uri = format!("file://{}", path.display());
+    let dbus_status = std::process::Command::new("dbus-send")
+        .args([
+            "--session",
+            "--dest=org.freedesktop.FileManager1",
+            "--type=method_call",
+            "/org/freedesktop/FileManager1",
+            "org.freedesktop.FileManager1.ShowItems",
+        ])
+        .arg(format!("array:string:{uri}"))
+        .arg("string:")
+        .status();
+
+    if matches!(dbus_status, Ok(status) if status.success()) {
+        perf::event(
+            "reveal_in_file_manager.dbus_show_items",
+            format!("path={}", path.display()),
+        );
+        return;
+    }
+
+    // Fallback: open the parent directory with `xdg-open`. This
+    // doesn't select the file, but at least gets the user to the
+    // right folder on systems without a FileManager1 implementation
+    // (e.g. minimal WMs, custom file managers).
+    let parent = path.parent().unwrap_or(path);
+    let _ = std::process::Command::new("xdg-open").arg(parent).status();
+    perf::event(
+        "reveal_in_file_manager.xdg_open_parent",
+        format!("parent={}", parent.display()),
+    );
 }
 
 impl Render for TempoApp {
@@ -2018,6 +2593,12 @@ impl Render for TempoApp {
                     .filter(|track_ix| *track_ix < self.tracks.len()),
                 |this, track_ix| this.child(self.render_context_menu(track_ix, cx)),
             )
+            .when(self.playlist_context_menu.is_some(), |this| {
+                this.child(self.render_playlist_context_menu(cx))
+            })
+            .when(self.playlist_delete_confirm.is_some(), |this| {
+                this.child(self.render_playlist_delete_confirm(cx))
+            })
             .when(self.column_menu_open, |this| {
                 this.child(self.render_column_menu(cx))
             })

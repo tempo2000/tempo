@@ -1,4 +1,8 @@
 use super::*;
+use std::io::BufWriter;
+use std::path::Path;
+use std::sync::OnceLock;
+use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 
 const LIBRARY_EVENT_TICK: Duration = Duration::from_millis(100);
@@ -7,6 +11,98 @@ const LIBRARY_EVENT_MAX_EVENTS: usize = 4;
 const METADATA_EVENT_TICK: Duration = Duration::from_millis(500);
 const METADATA_EVENT_MAX_EVENTS: usize = 16;
 const METADATA_ACTIVITY_TICK: Duration = Duration::from_secs(2);
+
+/// How long to wait after the last `request_save` call before actually
+/// flushing state.json to disk. Tuned to absorb high-frequency callers
+/// such as volume-slider drags and column reorder bursts.
+const STATE_SAVE_DEBOUNCE: StdDuration = StdDuration::from_millis(500);
+
+/// Background save loop: holds a single MPSC receiver, debounces snapshots
+/// (keeping only the latest), and writes them to disk off the UI thread.
+/// Initialized lazily on first use; the worker thread lives for the
+/// lifetime of the process.
+fn state_save_sender() -> &'static mpsc::Sender<(PathBuf, AppState)> {
+    static SENDER: OnceLock<mpsc::Sender<(PathBuf, AppState)>> = OnceLock::new();
+    SENDER.get_or_init(spawn_state_saver)
+}
+
+fn spawn_state_saver() -> mpsc::Sender<(PathBuf, AppState)> {
+    let (tx, rx) = mpsc::channel::<(PathBuf, AppState)>();
+    thread::Builder::new()
+        .name("tempo-state-saver".into())
+        .spawn(move || run_state_saver(rx))
+        .expect("failed to spawn state saver thread");
+    tx
+}
+
+fn run_state_saver(rx: mpsc::Receiver<(PathBuf, AppState)>) {
+    // Hold at most one pending snapshot. Any subsequent send during the
+    // debounce window simply overwrites it; only the latest snapshot is
+    // ever written, which is correct because state.json is fully
+    // overwritten on each save.
+    let mut pending: Option<(PathBuf, AppState)> = None;
+    loop {
+        let next = if pending.is_some() {
+            rx.recv_timeout(STATE_SAVE_DEBOUNCE).map(Some)
+        } else {
+            rx.recv()
+                .map(Some)
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+
+        match next {
+            Ok(Some((path, state))) => {
+                pending = Some((path, state));
+            }
+            Ok(None) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some((path, state)) = pending.take() {
+                    write_state_to_disk(&path, &state);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some((path, state)) = pending.take() {
+                    write_state_to_disk(&path, &state);
+                }
+                return;
+            }
+        }
+    }
+}
+
+fn write_state_to_disk(path: &Path, state: &AppState) {
+    let _span = perf::slow_span(
+        "app_state.write",
+        StdDuration::from_millis(4),
+        format!("path={}", path.display()),
+    );
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+
+    // Atomic write: serialize to a temp sibling, then rename. Eliminates
+    // the risk of leaving a half-written state.json after a crash mid-write.
+    let tmp_path = path.with_extension("json.tmp");
+    let file = match fs::File::create(&tmp_path) {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    let mut writer = BufWriter::new(file);
+    if serde_json::to_writer(&mut writer, state).is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+    use std::io::Write;
+    if writer.flush().is_err() {
+        let _ = fs::remove_file(&tmp_path);
+        return;
+    }
+    drop(writer);
+    let _ = fs::rename(&tmp_path, path);
+}
 
 impl TempoApp {
     pub(super) fn default_library_roots(saved_roots: &[PathBuf]) -> Vec<PathBuf> {
@@ -48,13 +144,12 @@ impl TempoApp {
             .map(|home| home.join(".config").join("tempo").join("state.json"))
     }
 
-    pub(super) fn save_app_state(&self) {
-        let _span = perf::slow_span("app_state.save", Duration::from_millis(4), "");
-        let Some(path) = Self::app_state_path() else {
-            return;
-        };
-
-        let state = AppState {
+    /// Build a serializable snapshot of the app's persistent state. Heavy
+    /// `clone()` calls live here because `AppState` owns its data; the
+    /// serialize + I/O work is performed by the background save thread,
+    /// so the snapshot itself is the only cost paid on the UI thread.
+    pub(super) fn build_app_state_snapshot(&self) -> AppState {
+        AppState {
             library_roots: self.library_roots.clone(),
             playlists: self.playlists.clone(),
             theme_id: self.theme_id.clone(),
@@ -78,17 +173,32 @@ impl TempoApp {
                 .tracks
                 .get(self.playing_track)
                 .map(|track| track.path.clone()),
-        };
+        }
+    }
 
-        let Some(parent) = path.parent() else {
+    /// Request a debounced state save. Cheap on the calling thread: takes
+    /// a snapshot of the persistent fields and hands it to a long-running
+    /// background thread that coalesces high-frequency callers (volume
+    /// drag, column reorder) into a single write per `STATE_SAVE_DEBOUNCE`
+    /// window. Used everywhere except shutdown.
+    pub(super) fn save_app_state(&self) {
+        let _span = perf::slow_span("app_state.save_request", Duration::from_millis(4), "");
+        let Some(path) = Self::app_state_path() else {
             return;
         };
+        let state = self.build_app_state_snapshot();
+        let _ = state_save_sender().send((path, state));
+    }
 
-        if fs::create_dir_all(parent).is_ok()
-            && let Ok(contents) = serde_json::to_string_pretty(&state)
-        {
-            let _ = fs::write(path, contents);
-        }
+    /// Synchronous, blocking save. Used at shutdown so the latest state is
+    /// always flushed even if the debounce window hadn't elapsed.
+    pub(super) fn save_app_state_now(&self) {
+        let _span = perf::slow_span("app_state.save_now", Duration::from_millis(4), "");
+        let Some(path) = Self::app_state_path() else {
+            return;
+        };
+        let state = self.build_app_state_snapshot();
+        write_state_to_disk(&path, &state);
     }
 
     pub(super) fn saved_tabs(&self) -> Vec<SavedBrowseTab> {
@@ -171,6 +281,8 @@ impl TempoApp {
                     .unwrap_or_default()
             },
         );
+        self.track_path_index = build_track_path_index(&self.tracks);
+        self.library_size_bytes = self.tracks.iter().map(|track| track.file_size).sum();
         perf::time("library.restart_watcher.reload_browse", "", || {
             self.reload_catalog_browse_data()
         });
@@ -619,9 +731,15 @@ impl TempoApp {
         let _span = perf::span("library.reload_catalog_browse_data", "");
         if let Ok(artists) = Self::load_cached_artists(self.catalog.as_ref(), &self.library_roots) {
             self.artists = artists;
+            // Bump the generation so the browse filter cache invalidates
+            // on the next read; the cache key includes this counter.
+            self.artists_generation = self.artists_generation.wrapping_add(1);
+            self.artist_filter_cache.borrow_mut().invalidate();
         }
         if let Ok(albums) = Self::load_cached_albums(self.catalog.as_ref(), &self.library_roots) {
             self.albums = albums;
+            self.albums_generation = self.albums_generation.wrapping_add(1);
+            self.album_filter_cache.borrow_mut().invalidate();
         }
     }
 
@@ -657,11 +775,18 @@ impl TempoApp {
                 self.scan_changed_tracks = self.scan_changed_tracks || indexed_count > 0;
                 for track in tracks {
                     let track = Track::from(track);
-                    if let Some(existing_ix) = self
-                        .tracks
-                        .iter()
-                        .position(|existing| existing.path == track.path)
-                    {
+                    // O(1) reverse lookup via `track_path_index` instead of
+                    // the prior O(N) linear scan over `self.tracks`. This
+                    // matters: cold scans of a 50k-track library used to
+                    // do ~50k * (batch_size) PathBuf comparisons per
+                    // batch.
+                    if let Some(&existing_ix) = self.track_path_index.get(&track.path) {
+                        // Maintain `library_size_bytes` incrementally:
+                        // subtract the old size before overwriting.
+                        let old_size = self.tracks[existing_ix].file_size;
+                        self.library_size_bytes = self.library_size_bytes.saturating_sub(old_size);
+                        self.library_size_bytes =
+                            self.library_size_bytes.saturating_add(track.file_size);
                         self.tracks[existing_ix] = track;
                         if existing_ix < self.waveform_cache.len() {
                             self.waveform_cache[existing_ix] = None;
@@ -670,6 +795,10 @@ impl TempoApp {
                             self.waveform_loading[existing_ix] = false;
                         }
                     } else {
+                        let new_ix = self.tracks.len();
+                        self.track_path_index.insert(track.path.clone(), new_ix);
+                        self.library_size_bytes =
+                            self.library_size_bytes.saturating_add(track.file_size);
                         self.tracks.push(track);
                         self.waveform_cache.push(None);
                         self.waveform_loading.push(false);
@@ -741,6 +870,8 @@ impl TempoApp {
                         Self::load_cached_tracks(self.catalog.as_ref(), &self.library_roots)
                 {
                     self.tracks = tracks;
+                    self.track_path_index = build_track_path_index(&self.tracks);
+                    self.library_size_bytes = self.tracks.iter().map(|track| track.file_size).sum();
                     self.waveform_cache.clear();
                     self.waveform_loading.clear();
                     self.invalidate_track_indices();
@@ -792,6 +923,8 @@ impl TempoApp {
         removed_indices.sort_unstable_by(|left, right| right.cmp(left));
 
         for ix in &removed_indices {
+            let removed_size = self.tracks[*ix].file_size;
+            self.library_size_bytes = self.library_size_bytes.saturating_sub(removed_size);
             self.tracks.remove(*ix);
             if *ix < self.waveform_cache.len() {
                 self.waveform_cache.remove(*ix);
@@ -801,6 +934,11 @@ impl TempoApp {
             }
             self.remove_track_from_queue(*ix);
         }
+        // Removals shift every subsequent track's index, so the reverse
+        // map needs a full rebuild. Removals are far less common than
+        // upserts, and this rebuild is still O(N) instead of the prior
+        // O(N*M) per-batch upsert scan it replaces.
+        self.track_path_index = build_track_path_index(&self.tracks);
 
         self.invalidate_track_indices();
         self.reload_catalog_browse_data();
