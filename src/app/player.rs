@@ -1387,40 +1387,47 @@ impl TempoApp {
                         .child("No output devices found"),
                 )
             })
-            .children(devices.into_iter().map(move |device| {
-                let selected = device.name == current_output;
-                let label = if device.is_default {
-                    format!("{} (default)", device.name)
-                } else {
-                    device.name.clone()
-                };
-                let output_name = device.name;
+            .children(
+                devices
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(device_ix, device)| {
+                        let selected = device.name == current_output;
+                        let label = if device.is_default {
+                            format!("{} (default)", device.name)
+                        } else {
+                            device.name.clone()
+                        };
+                        let output_name = device.name;
 
-                self.menu_item_base(SharedString::from(format!("output-device-{output_name}")))
-                    .h(px(30.0))
-                    .justify_between()
-                    .text_color(rgb(if selected {
-                        colors.accent_soft
-                    } else {
-                        colors.text
-                    }))
-                    .hover(move |this| {
-                        this.bg(rgb(colors.button_hover))
-                            .text_color(rgb(colors.text_strong))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_output_device(output_name.clone());
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(label),
-                    )
-                    .child(if selected { "✓" } else { "" })
-            }))
+                        self.menu_item_base(SharedString::from(format!(
+                            "output-device-{device_ix}"
+                        )))
+                        .h(px(30.0))
+                        .justify_between()
+                        .text_color(rgb(if selected {
+                            colors.accent_soft
+                        } else {
+                            colors.text
+                        }))
+                        .hover(move |this| {
+                            this.bg(rgb(colors.button_hover))
+                                .text_color(rgb(colors.text_strong))
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_output_device(output_name.clone());
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(label),
+                        )
+                        .child(if selected { "✓" } else { "" })
+                    }),
+            )
     }
 
     pub(super) fn bitrate_label(track: &Track) -> String {

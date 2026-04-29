@@ -122,6 +122,16 @@ impl TempoApp {
         self.hide_tooltip(&id.into(), cx);
     }
 
+    pub(super) fn clear_tooltip(&mut self) {
+        if self.hovered_tooltip_id.is_none() && self.tooltip.is_none() {
+            return;
+        }
+
+        self.tooltip_generation = self.tooltip_generation.wrapping_add(1);
+        self.hovered_tooltip_id = None;
+        self.tooltip = None;
+    }
+
     pub(super) fn render_tooltip(&self, tooltip: &Tooltip) -> impl IntoElement + use<> {
         let colors = *self.colors();
 
