@@ -47,10 +47,23 @@ mod text_input;
 mod theme;
 mod tooltip;
 
+// Re-export the layout helpers so direct child modules
+// (`sidebar`, `table`, `library_view`, etc.) and grandchild modules
+// (`player::*`) can call `menu_at`/`menu_panel`/etc. via `super::*`
+// without an explicit `use crate::app::menu::...` line. The helpers
+// are free functions taking `ThemeColors` so any entity can render
+// menus and album tiles uniformly. See the module docs in
+// `src/app/menu.rs` and `src/app/artwork.rs`.
+pub(in crate::app) use menu::{
+    menu_at, menu_header, menu_header_with_subtitle, menu_item, menu_item_base, menu_panel,
+    menu_section_label,
+};
+
 use crate::{
     CloseAllTabs, CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack,
     NavigateForward, NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab,
-    TogglePause,
+    SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8,
+    SelectTab9, SelectTab10, TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -367,20 +380,10 @@ struct WaveformSource {
     duration_value: Duration,
 }
 
-impl WaveformSource {
-    fn from_track(track: &Track) -> Self {
-        // All four text fields are `SharedString`, so the clones are
-        // refcount bumps, not allocations.
-        Self {
-            path: track.path.clone(),
-            title: track.title.clone(),
-            artist: track.artist.clone(),
-            album: track.album.clone(),
-            duration: track.duration.clone(),
-            duration_value: track.duration_value,
-        }
-    }
-}
+// `WaveformSource` is constructed inline by `PlayerEntity::cached_waveform_for_path`
+// (the only caller) from a `PlayingTrackSnapshot`. The previous
+// `from_track(&Track)` constructor is gone with the entity split
+// since the entity no longer borrows a `Track` directly.
 
 #[derive(Clone)]
 enum TrackArtwork {
@@ -907,12 +910,7 @@ const WAVEFORM_CACHE_VERSION: u32 = 1;
 const WAVEFORM_SAMPLED_MIN_DURATION: Duration = Duration::from_secs(30);
 const WAVEFORM_MIN_SAMPLE_FRAMES: usize = 256;
 const WAVEFORM_MAX_SAMPLE_FRAMES: usize = 2048;
-const PLAYER_BAR_PAD: f32 = 16.0;
-const PLAYER_ART_W: f32 = 54.0;
-const PLAYER_INFO_W: f32 = 220.0;
-const PLAYER_CONTROLS_W: f32 = 170.0;
 const PLAYER_VOLUME_BAR_W: f32 = 104.0;
-const PLAYER_GAP: f32 = 16.0;
 const TABLE_SCROLLBAR_W: f32 = 54.0;
 const TABLE_SCROLLBAR_TRACK_W: f32 = 6.0;
 const TABLE_SCROLLBAR_MARGIN: f32 = 4.0;
@@ -1081,11 +1079,6 @@ pub(crate) struct TempoApp {
     /// row would stop refreshing on track change), so it lives on the
     /// app for the app's lifetime.
     _player_subscription: Subscription,
-    /// Held observation that forwards untyped `cx.notify()` calls on
-    /// the player to a parent rerender. Required while the player
-    /// bar is rendered as part of `TempoApp::render` rather than as
-    /// a child entity — see the construction-site comment in `new`.
-    _player_observation: Subscription,
     _save_on_quit: Option<Subscription>,
 }
 
@@ -1140,6 +1133,15 @@ impl TempoApp {
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
         let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
+        // Resolve the active theme's colors once up front so we can
+        // hand them to `PlayerEntity::new` (which renders entirely
+        // from its own state, including theme colors).
+        let initial_theme_colors = themes
+            .iter()
+            .find(|theme| theme.id == theme_id)
+            .or_else(|| themes.first())
+            .map(|theme| theme.colors)
+            .expect("at least one theme is always bundled");
         // Construct the audio playback entity. Audio backend init is
         // deferred to `start_deferred_playback_init` (called below
         // after the entity is in the entity map) so the 25–50ms cpal
@@ -1149,6 +1151,7 @@ impl TempoApp {
                 volume,
                 state.output_device.clone(),
                 catalog.clone(),
+                initial_theme_colors,
                 player_cx,
             )
         });
@@ -1156,21 +1159,15 @@ impl TempoApp {
         // (track change, play/pause flip, auto-advance, etc.); the
         // held subscription lives on `TempoApp` for its lifetime so
         // events keep flowing until the app exits.
+        //
+        // We deliberately do *not* `cx.observe(&player, ...)` — the
+        // player owns its own `Render` impl now, so its per-frame
+        // `cx.notify()` calls invalidate only the player-bar subtree.
+        // That's the whole point of the Entity split: the 1 Hz
+        // playback tick stops repainting the table/sidebar/grids.
         let player_subscription = cx.subscribe(&player, |this, _player, event, cx| {
             this.handle_player_event(event, cx);
         });
-        // Also observe untyped notifies so the player bar repaints
-        // when the playback tick advances. Today the player bar is
-        // rendered inside `TempoApp::render_player_bar` (parent
-        // owns the layout), so a player-side `cx.notify()` has to
-        // surface as a parent repaint to take effect. A future
-        // refactor that gives `PlayerEntity` its own `Render` impl
-        // and embeds it as a child element will localize the
-        // invalidation; until then, the tick rate is throttled to
-        // ~1 Hz inside the player so this is no worse than the
-        // pre-Entity-split baseline (which also did whole-tree
-        // repaints at 1 Hz).
-        let player_observation = cx.observe(&player, |_this, _player, cx| cx.notify());
 
         let initial_page = if roots.is_empty() {
             Page::Settings
@@ -1197,6 +1194,17 @@ impl TempoApp {
                 })
             })
             .unwrap_or(0);
+        // Seed the player's render snapshot with whichever track will
+        // be visible in the player bar at startup. If the library is
+        // empty `cached_tracks` is empty and the player renders the
+        // empty placeholder — `set_playing_track(None)` is the
+        // default but we set it explicitly for clarity.
+        let initial_player_snapshot = cached_tracks
+            .get(initial_playing_track)
+            .map(player::PlayingTrackSnapshot::from_track);
+        player.update(cx, |player, _| {
+            player.set_playing_track(initial_player_snapshot);
+        });
         let mut tabs = Self::restore_tabs(&state.tabs);
         if tabs.is_empty() {
             tabs.push(BrowseTab::library(1));
@@ -1315,7 +1323,6 @@ impl TempoApp {
             volume_snapshot: volume,
             output_device_snapshot: state.output_device.clone(),
             _player_subscription: player_subscription,
-            _player_observation: player_observation,
             _save_on_quit: Some(save_on_quit),
         };
 
@@ -1957,9 +1964,15 @@ impl TempoApp {
         &self.theme().colors
     }
 
-    fn set_theme(&mut self, theme_id: &str) {
+    fn set_theme(&mut self, theme_id: &str, cx: &mut Context<Self>) {
         if self.themes.iter().any(|theme| theme.id == theme_id) {
             self.theme_id = theme_id.to_string();
+            // Mirror the new colors to the player so its independent
+            // render path stays in sync.
+            let new_colors = *self.colors();
+            self.player.update(cx, |player, player_cx| {
+                player.set_theme_colors(new_colors, player_cx);
+            });
             self.save_app_state();
         }
     }
@@ -2320,8 +2333,8 @@ fn album_searchable_lower(
 
 impl From<tempo::library::Track> for Track {
     fn from(track: tempo::library::Track) -> Self {
-        let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
-        let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+        let album_initials = artwork::album_initials_for(&track.album, &track.title);
+        let album_color = artwork::album_color_for(&track.album, &track.artist);
         let genre = track.genre.unwrap_or_else(|| "Unknown genre".to_string());
         let year = track.year.unwrap_or_else(|| "Unknown year".to_string());
         let searchable_lower = track_searchable_lower(
@@ -2362,8 +2375,8 @@ impl From<tempo::library::Track> for Track {
 
 impl From<CatalogTrack> for Track {
     fn from(track: CatalogTrack) -> Self {
-        let album_initials = TempoApp::album_initials_for(&track.album, &track.title);
-        let album_color = TempoApp::album_color_for(&track.album, &track.artist);
+        let album_initials = artwork::album_initials_for(&track.album, &track.title);
+        let album_color = artwork::album_color_for(&track.album, &track.artist);
         let genre = track.genre.unwrap_or_else(|| "Unknown genre".to_string());
         let year = track.year.unwrap_or_else(|| "Unknown year".to_string());
         let searchable_lower = track_searchable_lower(
@@ -2412,8 +2425,8 @@ impl From<CatalogArtist> for Artist {
         );
         Self {
             artist_id: artist.artist_id,
-            initials: TempoApp::initials_for(&artist.name),
-            color: TempoApp::color_for(&artist.name, "artist"),
+            initials: artwork::initials_for(&artist.name),
+            color: artwork::color_for(&artist.name, "artist"),
             name: artist.name,
             bio: artist.bio,
             photo_path: artist.photo_path,
@@ -2435,8 +2448,8 @@ impl From<CatalogAlbum> for Album {
         Self {
             album_id: album.album_id,
             artist_id: album.artist_id,
-            initials: TempoApp::initials_for(&album.title),
-            color: TempoApp::album_color_for(&album.title, &album.artist),
+            initials: artwork::initials_for(&album.title),
+            color: artwork::album_color_for(&album.title, &album.artist),
             title: album.title,
             artist: album.artist,
             year: album.year,
@@ -2606,6 +2619,16 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::close_all_tabs_action))
             .on_action(cx.listener(Self::next_tab_action))
             .on_action(cx.listener(Self::previous_tab_action))
+            .on_action(cx.listener(Self::select_tab_1_action))
+            .on_action(cx.listener(Self::select_tab_2_action))
+            .on_action(cx.listener(Self::select_tab_3_action))
+            .on_action(cx.listener(Self::select_tab_4_action))
+            .on_action(cx.listener(Self::select_tab_5_action))
+            .on_action(cx.listener(Self::select_tab_6_action))
+            .on_action(cx.listener(Self::select_tab_7_action))
+            .on_action(cx.listener(Self::select_tab_8_action))
+            .on_action(cx.listener(Self::select_tab_9_action))
+            .on_action(cx.listener(Self::select_tab_10_action))
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::play_random_track_action))
@@ -2648,7 +2671,19 @@ impl Render for TempoApp {
                     .child(self.render_left_sidebar(cx))
                     .child(self.render_content(window, cx)),
             )
-            .child(self.render_player_bar(window, cx))
+            // Player bar: when the library is empty there's no
+            // currently-playing track snapshot to render with, so we
+            // fall back to an inline placeholder that knows about
+            // scan state. Otherwise we embed the `PlayerEntity` as a
+            // child element — its `cx.notify()` calls only invalidate
+            // the player's own subtree, which is what unlocks the
+            // localized-invalidation perf win.
+            .child(if self.tracks.is_empty() {
+                self.render_empty_player_bar(cx)
+            } else {
+                let _ = window;
+                self.player.clone().into_any_element()
+            })
             .when_some(
                 self.context_menu_track
                     .filter(|track_ix| *track_ix < self.tracks.len()),
@@ -2780,6 +2815,53 @@ impl TempoApp {
             self.select_tab(target);
             cx.notify();
         }
+    }
+
+    fn select_tab_by_position(&mut self, tab_ix: usize, cx: &mut Context<Self>) {
+        if tab_ix < self.tabs.len() && tab_ix != self.active_tab {
+            self.select_tab(tab_ix);
+            cx.notify();
+        }
+    }
+
+    fn select_tab_1_action(&mut self, _: &SelectTab1, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(0, cx);
+    }
+
+    fn select_tab_2_action(&mut self, _: &SelectTab2, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(1, cx);
+    }
+
+    fn select_tab_3_action(&mut self, _: &SelectTab3, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(2, cx);
+    }
+
+    fn select_tab_4_action(&mut self, _: &SelectTab4, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(3, cx);
+    }
+
+    fn select_tab_5_action(&mut self, _: &SelectTab5, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(4, cx);
+    }
+
+    fn select_tab_6_action(&mut self, _: &SelectTab6, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(5, cx);
+    }
+
+    fn select_tab_7_action(&mut self, _: &SelectTab7, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(6, cx);
+    }
+
+    fn select_tab_8_action(&mut self, _: &SelectTab8, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(7, cx);
+    }
+
+    fn select_tab_9_action(&mut self, _: &SelectTab9, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(8, cx);
+    }
+
+    fn select_tab_10_action(&mut self, _: &SelectTab10, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_tab_by_position(9, cx);
     }
 
     /// Resolve the next/previous tab index with wrap-around. Returns

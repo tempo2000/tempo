@@ -258,7 +258,7 @@ impl TempoApp {
                     .child(if selected { "Active" } else { "" }),
             )
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_theme(&theme_id);
+                this.set_theme(&theme_id, cx);
                 cx.notify();
             }))
     }

@@ -613,7 +613,7 @@ impl TempoApp {
                     .text_color(rgb(colors.text_faint))
                     .child(format!("{}", ix + 1)),
             )
-            .child(self.album_tile(track, 28.0))
+            .child(artwork::album_tile(track, 28.0, colors))
             .child(
                 div()
                     .flex_1()
@@ -667,29 +667,30 @@ impl TempoApp {
             .get(playlist_ix)
             .map(|playlist| playlist.name.clone())
             .unwrap_or_default();
+        let colors = *self.colors();
 
-        let panel =
-            self.menu_panel(190.0)
-                .child(self.menu_header(name))
-                .child(self.context_menu_item("Open").on_click(cx.listener(
-                    move |this, _, _, cx| {
+        let panel = menu_panel(190.0, colors)
+            .child(menu_header(name, colors))
+            .child(
+                self.context_menu_item("Open")
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.close_playlist_context_menu();
                         this.open_playlist_tab(playlist_ix);
                         cx.notify();
-                    },
-                )))
-                .child(self.context_menu_item("Rename").on_click(cx.listener(
-                    move |this, _, window, cx| {
-                        this.start_playlist_rename(playlist_ix, window, cx);
-                        cx.notify();
-                    },
-                )))
-                .child(self.context_menu_item("Delete").on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.request_delete_playlist(playlist_ix);
-                        cx.notify();
-                    },
-                )));
+                    })),
+            )
+            .child(self.context_menu_item("Rename").on_click(cx.listener(
+                move |this, _, window, cx| {
+                    this.start_playlist_rename(playlist_ix, window, cx);
+                    cx.notify();
+                },
+            )))
+            .child(self.context_menu_item("Delete").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.request_delete_playlist(playlist_ix);
+                    cx.notify();
+                },
+            )));
 
         // Transparent full-window click-eater behind the anchored menu.
         // Any mouse-down here dismisses the menu without triggering
@@ -717,7 +718,7 @@ impl TempoApp {
                     cx.notify();
                 }),
             )
-            .child(self.menu_at(
+            .child(menu_at(
                 menu.position,
                 Corner::TopLeft,
                 point(px(2.0), px(2.0)),

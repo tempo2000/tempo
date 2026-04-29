@@ -1427,10 +1427,10 @@ impl TempoApp {
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                        artwork::album_tile_fallback(fallback_initials.clone(), color, colors)
                     })
                     .into_any_element(),
-                None => Self::album_tile_fallback(initials, color, colors),
+                None => artwork::album_tile_fallback(initials, color, colors),
             })
             .into_any_element()
     }
@@ -1458,10 +1458,10 @@ impl TempoApp {
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                        artwork::album_tile_fallback(fallback_initials.clone(), color, colors)
                     })
                     .into_any_element(),
-                None => Self::album_tile_fallback(initials, color, colors),
+                None => artwork::album_tile_fallback(initials, color, colors),
             })
             .into_any_element()
     }
@@ -1490,10 +1490,10 @@ impl TempoApp {
                     .size_full()
                     .object_fit(ObjectFit::Cover)
                     .with_fallback(move || {
-                        Self::album_tile_fallback(fallback_initials.clone(), color, colors)
+                        artwork::album_tile_fallback(fallback_initials.clone(), color, colors)
                     })
                     .into_any_element(),
-                None => Self::album_tile_fallback(initials, color, colors),
+                None => artwork::album_tile_fallback(initials, color, colors),
             })
             .into_any_element()
     }

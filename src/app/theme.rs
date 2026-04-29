@@ -10,7 +10,7 @@ pub(super) struct Theme {
     pub(super) colors: ThemeColors,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct ThemeColors {
     pub(super) app: u32,
     pub(super) panel: u32,

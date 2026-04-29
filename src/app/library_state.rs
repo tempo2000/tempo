@@ -305,6 +305,15 @@ impl TempoApp {
         }
         self.playing_track = 0;
         self.context_menu_track = None;
+        // Push a fresh snapshot so the player bar reflects the new
+        // tracks[0] (or shows the empty placeholder if the new
+        // library is empty).
+        let new_snapshot = self
+            .tracks
+            .first()
+            .map(player::PlayingTrackSnapshot::from_track);
+        self.player
+            .update(cx, |player, _| player.set_playing_track(new_snapshot));
         self.scan_progress = ScanProgress::default();
         self.is_scanning = false;
         self.last_scan_browse_reload = None;
@@ -993,15 +1002,16 @@ impl TempoApp {
             "Monitoring"
         };
 
-        if progress.discovered == 0 && progress.indexed == 0 && progress.errors == 0 {
-            return format!("{prefix}: looking for audio files...");
-        }
-
-        let status = format!(
-            "{prefix}: {} discovered, {} indexed",
-            progress.discovered, progress.indexed
-        );
-        status
+        // The full "{prefix}: looking for audio files..." / "{prefix}:
+        // N discovered, N indexed" form is still produced for the
+        // Settings page (`render_library_settings` calls
+        // `visible_scan_status()` which embeds this verbatim). For
+        // the top bar (`render_scan_status` →
+        // `visible_scan_status_without_errors`) we deliberately omit
+        // the counts because they update at high frequency during
+        // scans and the bare prefix is enough at-a-glance signal.
+        let _ = progress;
+        prefix.to_string()
     }
 
     pub(super) fn visible_scan_status(&self) -> String {

@@ -100,6 +100,11 @@ impl TempoApp {
         }
     }
 
+    /// Imperative tooltip show — currently unused (the volume-drag
+    /// caller migrated into the player entity, which renders its own
+    /// local tooltip). Retained for future hover-tooltip needs that
+    /// don't fit the standard hover-listener pattern.
+    #[allow(dead_code)]
     pub(super) fn show_tooltip_now(
         &mut self,
         id: impl Into<SharedString>,
@@ -118,6 +123,7 @@ impl TempoApp {
         cx.notify();
     }
 
+    #[allow(dead_code)]
     pub(super) fn hide_tooltip_now(&mut self, id: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.hide_tooltip(&id.into(), cx);
     }

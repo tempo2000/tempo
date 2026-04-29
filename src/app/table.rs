@@ -1949,9 +1949,9 @@ impl TempoApp {
                 .flex()
                 .items_center()
                 .child(if lightweight {
-                    self.album_tile_placeholder(track, 22.0)
+                    artwork::album_tile_placeholder(track, 22.0, colors)
                 } else {
-                    self.album_tile(track, 22.0)
+                    artwork::album_tile(track, 22.0, colors)
                 })
                 .into_any_element(),
             TableColumn::Title => div()
@@ -2001,18 +2001,19 @@ impl TempoApp {
     }
 
     pub(super) fn render_column_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        self.menu_at(
+        let colors = *self.colors();
+        menu_at(
             point(px(self.column_menu_x), px(self.column_menu_y)),
             Corner::TopLeft,
             point(px(2.0), px(2.0)),
-            self.menu_panel(220.0)
+            menu_panel(220.0, colors)
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|_this, _event: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
                     }),
                 )
-                .child(self.menu_header("Columns"))
+                .child(menu_header("Columns", colors))
                 .children(
                     ALL_TABLE_COLUMNS
                         .iter()
@@ -2030,10 +2031,10 @@ impl TempoApp {
         let colors = *self.colors();
         let checked = self.visible_columns.contains(&column);
         let locked = column == TableColumn::Title;
-        self.menu_item_base(SharedString::from(format!(
-            "column-menu-{}",
-            Self::column_key(column)
-        )))
+        menu_item_base(
+            SharedString::from(format!("column-menu-{}", Self::column_key(column))),
+            colors,
+        )
         .gap_2()
         .cursor(if locked {
             CursorStyle::Arrow
@@ -2254,12 +2255,13 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let track = &self.tracks[track_ix];
-        self.menu_at(
+        let colors = *self.colors();
+        menu_at(
             self.context_menu_position,
             Corner::TopLeft,
             point(px(2.0), px(2.0)),
-            self.menu_panel(190.0)
-                .child(self.menu_header(track.title.clone()))
+            menu_panel(190.0, colors)
+                .child(menu_header(track.title.clone(), colors))
                 .child(
                     self.context_menu_item("Play from start")
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2297,7 +2299,7 @@ impl TempoApp {
                         })),
                 )
                 .when(!self.playlists.is_empty(), |this| {
-                    this.child(self.menu_section_label("ADD TO PLAYLIST"))
+                    this.child(menu_section_label("ADD TO PLAYLIST", colors))
                         .children(self.playlists.iter().enumerate().map(
                             |(playlist_ix, playlist)| {
                                 self.context_menu_item_dynamic(format!("Add to {}", playlist.name))
@@ -2326,11 +2328,17 @@ impl TempoApp {
     }
 
     pub(super) fn context_menu_item(&self, label: &'static str) -> gpui::Stateful<gpui::Div> {
-        self.menu_item(SharedString::from(format!("context-menu-{label}")), label)
+        let colors = *self.colors();
+        menu_item(
+            SharedString::from(format!("context-menu-{label}")),
+            label,
+            colors,
+        )
     }
 
     pub(super) fn context_menu_item_dynamic(&self, label: String) -> gpui::Stateful<gpui::Div> {
+        let colors = *self.colors();
         let id = SharedString::from(format!("context-menu-{label}"));
-        self.menu_item(id, label)
+        menu_item(id, label, colors)
     }
 }
