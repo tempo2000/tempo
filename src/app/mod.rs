@@ -46,7 +46,7 @@ mod tooltip;
 
 use crate::{
     CloseTab, FocusSearch, MoveSelectionDown, MoveSelectionUp, NavigateBack, NavigateForward,
-    NewTab, OpenSettings, PlayRandomTrack, PlaySelected, TogglePause,
+    NewTab, NextTab, OpenSettings, PlayRandomTrack, PlaySelected, PreviousTab, TogglePause,
 };
 use text_input::TextInputState;
 use theme::{Theme, ThemeColors, bundled_themes, default_theme_id, resolve_theme_id};
@@ -1778,6 +1778,8 @@ impl Render for TempoApp {
             .on_action(cx.listener(Self::move_selection_down))
             .on_action(cx.listener(Self::new_tab))
             .on_action(cx.listener(Self::close_active_tab))
+            .on_action(cx.listener(Self::next_tab_action))
+            .on_action(cx.listener(Self::previous_tab_action))
             .on_action(cx.listener(Self::focus_search))
             .on_action(cx.listener(Self::open_settings_action))
             .on_action(cx.listener(Self::play_random_track_action))
@@ -1928,6 +1930,36 @@ impl TempoApp {
     fn close_active_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
         self.close_tab(self.active_tab);
         cx.notify();
+    }
+
+    fn next_tab_action(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = self.tab_offset_by(1) {
+            self.select_tab(target);
+            cx.notify();
+        }
+    }
+
+    fn previous_tab_action(&mut self, _: &PreviousTab, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(target) = self.tab_offset_by(-1) {
+            self.select_tab(target);
+            cx.notify();
+        }
+    }
+
+    /// Resolve the next/previous tab index with wrap-around. Returns
+    /// `None` if there are zero or one tabs (no movement is possible).
+    /// `delta` is signed so the same helper covers both directions; we
+    /// rely on the rust modulo trick `(a + n) % n` to keep the result
+    /// non-negative without depending on the sign of `%` for negatives.
+    fn tab_offset_by(&self, delta: isize) -> Option<usize> {
+        let count = self.tabs.len();
+        if count <= 1 {
+            return None;
+        }
+        let count_i = count as isize;
+        let current = self.active_tab as isize;
+        let target = ((current + delta) % count_i + count_i) % count_i;
+        Some(target as usize)
     }
 
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
