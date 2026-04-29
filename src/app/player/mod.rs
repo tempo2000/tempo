@@ -30,8 +30,9 @@ use super::*;
 use std::time::Instant;
 
 mod entity;
+mod render;
 
-pub(super) use entity::{PlayerEntity, PlayerEvent};
+pub(super) use entity::{PlayerEntity, PlayerEvent, PlayingTrackSnapshot};
 
 // ============================================================================
 // TempoApp glue methods — orchestration that touches both player state
@@ -91,6 +92,30 @@ impl TempoApp {
             PlayerEvent::StateMutated => {
                 self.refresh_player_state_snapshot(cx);
                 self.save_app_state();
+            }
+            PlayerEvent::RequestPlayPause => {
+                self.toggle_playback(cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestPlayPrev => {
+                self.play_adjacent_track(-1, cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestPlayNext => {
+                self.play_adjacent_track(1, cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestPlayRandom => {
+                self.play_random_track(cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestSeekFromWaveformClick { ratio } => {
+                self.seek_from_waveform_click(*ratio, cx);
+                cx.notify();
+            }
+            PlayerEvent::RequestSelectOutputDevice(name) => {
+                self.select_output_device(name.clone(), cx);
+                cx.notify();
             }
         }
     }
@@ -216,7 +241,10 @@ impl TempoApp {
             // doesn't leave half-decoded audio queued. This matches
             // user expectations ("library is empty, so should be
             // silent").
-            self.player.update(cx, |player, cx| player.stop(cx));
+            self.player.update(cx, |player, cx| {
+                player.stop(cx);
+                player.set_playing_track(None);
+            });
             return;
         }
 
@@ -241,6 +269,16 @@ impl TempoApp {
         }
 
         self.queue.retain(|track_ix| *track_ix <= last);
+
+        // After clamping, refresh the player's render snapshot from
+        // whichever track now occupies the `playing_track` slot. The
+        // path may have changed if scan replaced the file; the
+        // snapshot's `path` field is what the player uses to
+        // disambiguate "still the same track" so this keeps the
+        // player bar coherent with the table active row.
+        let snapshot = player::PlayingTrackSnapshot::from_track(&self.tracks[self.playing_track]);
+        self.player
+            .update(cx, |player, _| player.set_playing_track(Some(snapshot)));
     }
 
     pub(super) fn play_track(&mut self, track_ix: usize, cx: &mut Context<Self>) {
@@ -258,12 +296,16 @@ impl TempoApp {
             return;
         };
         let track_path = track.path.clone();
+        // Snapshot the render-relevant track fields *before* calling
+        // into the player; cheap clones (SharedString, PathBuf, Arc).
+        let snapshot = player::PlayingTrackSnapshot::from_track(track);
 
         self.playing_track = track_ix;
         self.set_active_selected_track(track_ix);
         self.context_menu_track = None;
 
         let result = self.player.update(cx, |player, cx| {
+            player.set_playing_track(Some(snapshot));
             player.start_playback(track_path.clone(), cx)
         });
 
@@ -351,53 +393,31 @@ impl TempoApp {
     }
 
     /// Programmatic volume change — currently unused by UI (the volume
-    /// bar drives the player directly via `begin_volume_drag` /
-    /// `drag_volume`), but exposed for future media-key / DBus
-    /// integration.
+    /// bar drives the player directly), but exposed for future
+    /// media-key / DBus integration.
     #[allow(dead_code)]
     pub(super) fn set_playback_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         self.player
             .update(cx, |player, cx| player.set_volume(volume, cx));
     }
 
-    pub(super) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
-        self.player.update(cx, |player, cx| player.toggle_mute(cx));
-    }
-
-    pub(super) fn set_max_volume(&mut self, cx: &mut Context<Self>) {
-        self.player
-            .update(cx, |player, cx| player.set_max_volume(cx));
-    }
-
-    pub(super) fn begin_volume_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        let position = self
-            .player
-            .update(cx, |player, cx| player.begin_volume_drag(event, cx));
-        let label = self.player.read(cx).volume_tooltip_label();
-        self.show_tooltip_now("volume-tooltip", label, position, cx);
-        cx.stop_propagation();
-    }
-
+    /// Volume drag fallback — catches mouse-move events that escape
+    /// the volume bar's own `on_mouse_move` listener (e.g. when the
+    /// user drags off the bar). Returns `true` if the drag was active
+    /// so `TempoApp::render` can stop propagation. Volume tooltip is
+    /// rendered locally inside the player bar; the parent doesn't
+    /// have to coordinate.
     pub(super) fn drag_volume(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
-        let drag_position = self
-            .player
-            .update(cx, |player, cx| player.drag_volume(event, cx));
-        let Some(position) = drag_position else {
-            return false;
-        };
-        let label = self.player.read(cx).volume_tooltip_label();
-        self.show_tooltip_now("volume-tooltip", label, position, cx);
-        true
+        self.player
+            .update(cx, |player, cx| player.drag_volume(event, cx))
+            .is_some()
     }
 
+    /// Volume drag-end fallback — catches mouse-up that escapes the
+    /// volume bar. Returns `true` if a drag was in progress.
     pub(super) fn finish_volume_drag(&mut self, cx: &mut Context<Self>) -> bool {
-        let was_dragging = self
-            .player
-            .update(cx, |player, cx| player.finish_volume_drag(cx));
-        if was_dragging {
-            self.hide_tooltip_now("volume-tooltip", cx);
-        }
-        was_dragging
+        self.player
+            .update(cx, |player, cx| player.finish_volume_drag(cx))
     }
 
     pub(super) fn play_adjacent_track(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -460,11 +480,6 @@ impl TempoApp {
         self.play_track(next, cx);
     }
 
-    pub(super) fn cycle_playback_mode(&mut self, cx: &mut Context<Self>) {
-        self.player
-            .update(cx, |player, cx| player.cycle_playback_mode(cx));
-    }
-
     /// Seek within the currently-playing track. If the audio backend
     /// is empty (e.g. after a stop), restarts playback from the
     /// current track first. Lives on `TempoApp` because the restart
@@ -492,18 +507,13 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn seek_from_waveform_click(
-        &mut self,
-        click_x: f32,
-        viewport_width: f32,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn seek_from_waveform_click(&mut self, ratio: f32, cx: &mut Context<Self>) {
         let Some(track) = self.tracks.get(self.playing_track) else {
             return;
         };
         let duration = track.duration_value;
         let outcome = self.player.update(cx, |player, cx| {
-            player.seek_from_waveform_click(click_x, viewport_width, duration, cx)
+            player.seek_from_waveform_click(ratio, duration, cx)
         });
         if outcome.needs_restart {
             // Backend was empty (e.g. seek after natural end-of-track
@@ -517,199 +527,33 @@ impl TempoApp {
 }
 
 // ============================================================================
-// Marquee helper — stateless, free function. Rendered by the player
-// bar but kept here (rather than in a separate module) to share the
-// gap/duration constants with the bar layout.
-// ============================================================================
-
-impl TempoApp {
-    fn render_marquee_text(
-        text: SharedString,
-        animation_id: impl Into<SharedString>,
-        available_width: f32,
-        average_char_width: f32,
-        color: u32,
-    ) -> AnyElement {
-        let text_width = (text.chars().count() as f32 * average_char_width).max(1.0);
-
-        if text_width <= available_width {
-            return div()
-                .w_full()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_color(rgb(color))
-                .child(text)
-                .into_any_element();
-        }
-
-        let gap = 44.0;
-        let scroll_distance = text_width + gap;
-        let duration = Duration::from_millis(((scroll_distance / 18.0).max(7.0) * 1000.0) as u64);
-
-        div()
-            .w_full()
-            .overflow_hidden()
-            .text_color(rgb(color))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .child(div().w(px(text_width)).flex_none().child(text.clone()))
-                    .child(div().w(px(gap)).flex_none())
-                    .child(div().w(px(text_width)).flex_none().child(text))
-                    .with_animation(
-                        animation_id.into(),
-                        Animation::new(duration).repeat(),
-                        move |this, delta| this.ml(px(-scroll_distance * delta)),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-// ============================================================================
-// Player bar rendering — reads current state from `self.player`,
-// dispatches mutations back through `self.player.update(cx, ...)`.
+// Empty-library placeholder + Settings page hooks
 //
-// Kept on `TempoApp` (not `PlayerEntity::render`) because it needs
-// the active track's metadata from `self.tracks` to paint the
-// marquees and album tile. A future refactor that pushes the active
-// `Track` clone onto the player after `play_track` could move this
-// wholesale; the rendering API is otherwise self-contained.
+// The player bar's main rendering moved to `PlayerEntity::render` (in
+// `render.rs`). Two helpers stay on `TempoApp`:
+//
+// 1. `render_empty_player_bar` — when the library is empty there's no
+//    `PlayingTrackSnapshot` to embed the entity with, and the
+//    placeholder needs `is_scanning` + `visible_scan_status()` which
+//    live on the parent. `TempoApp::render` calls this directly when
+//    `self.tracks.is_empty()`.
+//
+// 2. `playback_status_dropdown` / `settings_output_device_menu` —
+//    rendered on the Settings page (sibling of the player bar). The
+//    Settings-anchored variant of the output picker has to live at
+//    root for absolute positioning relative to the page; the player-
+//    anchored variant lives inside `PlayerEntity::render` instead.
 // ============================================================================
 
 impl TempoApp {
-    pub(super) fn render_player_bar(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    /// The empty placeholder that replaces the player bar when the
+    /// library has no tracks. Reads `is_scanning` + `visible_scan_status`
+    /// from `TempoApp` directly; `PlayerEntity` cannot render this
+    /// because it deliberately doesn't know about scan state.
+    pub(super) fn render_empty_player_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let colors = *self.colors();
-
-        if self.tracks.is_empty() {
-            return div()
-                .h(px(86.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_4()
-                .px_4()
-                .border_t_1()
-                .border_color(rgb(colors.button_hover))
-                .bg(rgb(colors.player))
-                .child(
-                    div()
-                        .w(px(54.0))
-                        .h(px(54.0))
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(colors.border_strong))
-                        .bg(rgb(colors.playing))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(colors.text_faint))
-                        .child("♪"),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(colors.text_strong))
-                                .child(if self.is_scanning {
-                                    "Scanning library"
-                                } else {
-                                    "Library scanner idle"
-                                }),
-                        )
-                        .child(
-                            div()
-                                .text_color(rgb(colors.text_muted))
-                                .child(self.visible_scan_status()),
-                        ),
-                )
-                .into_any_element();
-        }
-
-        self.playing_track = self.playing_track.min(self.tracks.len() - 1);
-        let playing_track_ix = self.playing_track;
-        let source = WaveformSource::from_track(&self.tracks[playing_track_ix]);
-        let (waveform, waveform_loading) = self
-            .player
-            .update(cx, |player, cx| player.cached_waveform(&source, cx));
-        if waveform_loading {
-            window.request_animation_frame();
-        }
-        // Snapshot all the player fields the render path consumes in
-        // one pass, releasing the borrow before we touch
-        // `self.tracks` / `self.colors()` / `self.album_tile_*` below.
-        // `alt_pressed` lives on the entity for future use (e.g.
-        // headless rendering), but the render path queries
-        // `window.modifiers().alt` directly because that's the
-        // authoritative source at paint time and accounts for
-        // modifier presses since the last `on_modifiers_changed`
-        // event.
-        let (
-            is_playing,
-            playback_position,
-            now_playing_info_hovered,
-            hovered_link,
-            playback_status_label,
-            volume,
-            output_menu_open_in_player,
-        ) = {
-            let player_state = self.player.read(cx);
-            (
-                player_state.is_playing(),
-                player_state.playback_position(),
-                player_state.now_playing_info_hovered(),
-                player_state.hovered_now_playing_link(),
-                player_state.playback_status_label(),
-                player_state.volume(),
-                player_state.output_menu_source() == Some(OutputMenuSource::Player),
-            )
-        };
-
-        let track = &self.tracks[playing_track_ix];
-        let playback_position = playback_position.min(track.duration_value);
-        let playback_progress = if track.duration_value.is_zero() {
-            0.0
-        } else {
-            (playback_position.as_secs_f32() / track.duration_value.as_secs_f32()).clamp(0.0, 1.0)
-        };
-        let now_playing_active_color = colors.accent;
-        let show_alternate_now_playing_info = now_playing_info_hovered && window.modifiers().alt;
-        let year_label = if track.year.eq_ignore_ascii_case("unknown year") {
-            "Unknown Year".to_string()
-        } else {
-            track.year.to_string()
-        };
-        let alternate_status = format!("{} | {}", year_label, playback_status_label);
-        let title_color = if hovered_link == Some(NowPlayingLink::Title) {
-            now_playing_active_color
-        } else {
-            colors.text_strong
-        };
-        let artist_color = if hovered_link == Some(NowPlayingLink::Artist) {
-            now_playing_active_color
-        } else {
-            colors.text_muted
-        };
-        let album_color = if hovered_link == Some(NowPlayingLink::Album) {
-            now_playing_active_color
-        } else {
-            colors.text_faint
-        };
-        let volume_fill = PLAYER_VOLUME_BAR_W * volume;
-
+        let _ = cx;
         div()
-            .id("player-bar")
-            .relative()
             .h(px(86.0))
             .flex_none()
             .flex()
@@ -719,352 +563,47 @@ impl TempoApp {
             .border_t_1()
             .border_color(rgb(colors.button_hover))
             .bg(rgb(colors.player))
-            .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
-                let needs_repaint = this
-                    .player
-                    .update(cx, |player, _| player.set_alt_pressed(event.modifiers.alt));
-                if needs_repaint {
-                    cx.notify();
-                }
-            }))
             .child(
                 div()
-                    .id("now-playing-album-link")
-                    .cursor_pointer()
-                    .child(self.album_tile_with_hover_border(
-                        track,
-                        54.0,
-                        Some(now_playing_active_color),
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_album_tab_for_track(playing_track_ix);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                div()
-                    .id("now-playing-info")
-                    .w(px(220.0))
-                    .flex_none()
-                    .min_w_0()
+                    .w(px(54.0))
+                    .h(px(54.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(colors.border_strong))
+                    .bg(rgb(colors.playing))
                     .flex()
-                    .flex_col()
+                    .items_center()
                     .justify_center()
-                    .gap(px(2.0))
-                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                        let alt = window.modifiers().alt;
-                        this.player.update(cx, |player, _| {
-                            player.set_now_playing_info_hovered(*hovered, alt);
-                        });
-                        cx.notify();
-                    }))
-                    .child(if show_alternate_now_playing_info {
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(colors.text_strong))
-                                    .child(Self::render_marquee_text(
-                                        track.codec.clone(),
-                                        SharedString::from(format!(
-                                            "now-playing-codec-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        8.6,
-                                        colors.text_strong,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_color(rgb(colors.text_muted))
-                                    .child(Self::render_marquee_text(
-                                        SharedString::from(Self::bitrate_label(track)),
-                                        SharedString::from(format!(
-                                            "now-playing-bitrate-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        7.8,
-                                        colors.text_muted,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_color(rgb(colors.text_faint))
-                                    .child(Self::render_marquee_text(
-                                        SharedString::from(alternate_status),
-                                        SharedString::from(format!(
-                                            "now-playing-status-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        7.8,
-                                        colors.text_faint,
-                                    )),
-                            )
-                    } else {
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .child(
-                                div()
-                                    .id("now-playing-title-link")
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(title_color))
-                                    .cursor_pointer()
-                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        this.player.update(cx, |player, _| {
-                                            if *hovered {
-                                                player.set_hovered_now_playing_link(Some(
-                                                    NowPlayingLink::Title,
-                                                ));
-                                            } else if player.hovered_now_playing_link()
-                                                == Some(NowPlayingLink::Title)
-                                            {
-                                                player.set_hovered_now_playing_link(None);
-                                            }
-                                        });
-                                        cx.notify();
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.select_track_in_all_music(playing_track_ix);
-                                        cx.notify();
-                                    }))
-                                    .child(Self::render_marquee_text(
-                                        track.title.clone(),
-                                        SharedString::from(format!(
-                                            "now-playing-title-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        8.6,
-                                        title_color,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("now-playing-artist-link")
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_color(rgb(artist_color))
-                                    .cursor_pointer()
-                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        this.player.update(cx, |player, _| {
-                                            if *hovered {
-                                                player.set_hovered_now_playing_link(Some(
-                                                    NowPlayingLink::Artist,
-                                                ));
-                                            } else if player.hovered_now_playing_link()
-                                                == Some(NowPlayingLink::Artist)
-                                            {
-                                                player.set_hovered_now_playing_link(None);
-                                            }
-                                        });
-                                        cx.notify();
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_artist_tab_for_track(playing_track_ix);
-                                        cx.notify();
-                                    }))
-                                    .child(Self::render_marquee_text(
-                                        track.artist.clone(),
-                                        SharedString::from(format!(
-                                            "now-playing-artist-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        7.8,
-                                        artist_color,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("now-playing-album-text-link")
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_color(rgb(album_color))
-                                    .cursor_pointer()
-                                    .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        this.player.update(cx, |player, _| {
-                                            if *hovered {
-                                                player.set_hovered_now_playing_link(Some(
-                                                    NowPlayingLink::Album,
-                                                ));
-                                            } else if player.hovered_now_playing_link()
-                                                == Some(NowPlayingLink::Album)
-                                            {
-                                                player.set_hovered_now_playing_link(None);
-                                            }
-                                        });
-                                        cx.notify();
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.open_album_tab_for_track(playing_track_ix);
-                                        cx.notify();
-                                    }))
-                                    .child(Self::render_marquee_text(
-                                        track.album.clone(),
-                                        SharedString::from(format!(
-                                            "now-playing-album-marquee-{playing_track_ix}"
-                                        )),
-                                        220.0,
-                                        7.8,
-                                        album_color,
-                                    )),
-                            )
-                    }),
+                    .text_color(rgb(colors.text_faint))
+                    .child("♪"),
             )
             .child(
                 div()
-                    .flex_1()
-                    .h_full()
-                    .relative()
-                    .child(self.waveform_seekbar(
-                        SharedString::from(format_duration(playback_position)),
-                        track.duration.clone(),
-                        playback_progress,
-                        waveform,
-                        waveform_loading,
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .w(px(170.0))
                     .flex()
                     .flex_col()
-                    .gap_2()
-                    .text_color(rgb(colors.text_muted))
-                    .child(self.transport_overlay(is_playing, cx))
+                    .gap_1()
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .id("volume-mute")
-                                    .cursor_pointer()
-                                    .active(|this| this.opacity(0.75))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_mute(cx);
-                                        cx.notify();
-                                    }))
-                                    .child(Self::volume_speaker_icon(1, colors)),
-                            )
-                            .child({
-                                let volume_handle =
-                                    self.player.read(cx).volume_bar_scroll_handle.clone();
-                                div()
-                                    .id("volume-bar")
-                                    .w(px(PLAYER_VOLUME_BAR_W))
-                                    .h(px(18.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .cursor_pointer()
-                                    .track_scroll(&volume_handle)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, event: &MouseDownEvent, _window, cx| {
-                                            this.begin_volume_drag(event, cx);
-                                        }),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .h(px(3.0))
-                                            .rounded_full()
-                                            .bg(rgb(colors.text_faint))
-                                            .child(
-                                                div()
-                                                    .w(px(volume_fill))
-                                                    .h(px(3.0))
-                                                    .rounded_full()
-                                                    .bg(rgb(colors.text)),
-                                            ),
-                                    )
-                            })
-                            .child(
-                                div()
-                                    .id("volume-max")
-                                    .cursor_pointer()
-                                    .active(|this| this.opacity(0.75))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_max_volume(cx);
-                                        cx.notify();
-                                    }))
-                                    .child(Self::volume_speaker_icon(3, colors)),
-                            ),
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(colors.text_strong))
+                            .child(if self.is_scanning {
+                                "Scanning library"
+                            } else {
+                                "Library scanner idle"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(colors.text_muted))
+                            .child(self.visible_scan_status()),
                     ),
             )
-            .when(output_menu_open_in_player, |this| {
-                this.child(self.player_output_device_menu(cx))
-            })
             .into_any_element()
     }
 
-    pub(super) fn playback_mode_icon(&self, cx: &gpui::App) -> &'static str {
-        match self.player.read(cx).playback_mode() {
-            PlaybackMode::Straight => "→",
-            PlaybackMode::Loop => "↻",
-            PlaybackMode::Shuffle => "⤨",
-        }
-    }
-
-    pub(super) fn volume_speaker_icon(waves: usize, colors: ThemeColors) -> AnyElement {
-        let color = format!("#{:06x}", colors.text_muted);
-        let mut wave_paths = String::new();
-
-        if waves >= 1 {
-            wave_paths.push_str(&format!(
-                r#"<path d="M14.5 9.4C15.2 10.1 15.6 11 15.6 12C15.6 13 15.2 13.9 14.5 14.6" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
-            ));
-        }
-
-        if waves >= 2 {
-            wave_paths.push_str(&format!(
-                r#"<path d="M17 7.2C18.2 8.5 18.9 10.2 18.9 12C18.9 13.8 18.2 15.5 17 16.8" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
-            ));
-        }
-
-        if waves >= 3 {
-            wave_paths.push_str(&format!(
-                r#"<path d="M19.4 5C21 7 22 9.4 22 12C22 14.6 21 17 19.4 19" fill="none" stroke="{color}" stroke-width="1.8" stroke-linecap="round"/>"#
-            ));
-        }
-
-        let svg = format!(
-            r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"><path d="M3 9V15H7L12 19V5L7 9H3Z" fill="{color}"/>{wave_paths}</svg>"#
-        );
-
-        img(Arc::new(Image::from_bytes(
-            ImageFormat::Svg,
-            svg.into_bytes(),
-        )))
-        .w(px(18.0))
-        .h(px(18.0))
-        .into_any_element()
-    }
-
+    /// Output-device dropdown trigger. Used by the Settings page (and
+    /// previously by the player bar before its rendering moved into
+    /// `PlayerEntity::render`).
     pub(super) fn playback_status_dropdown(
         &self,
         source: OutputMenuSource,
@@ -1106,353 +645,91 @@ impl TempoApp {
             )
     }
 
-    pub(super) fn player_output_device_menu(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let position = self.player.read(cx).output_menu_position();
-        self.menu_at(
-            position,
-            Corner::BottomLeft,
-            point(px(0.0), px(-8.0)),
-            self.output_device_menu(OutputMenuSource::Player, cx),
-        )
-    }
-
+    /// Settings-anchored output device picker. Rendered as a child of
+    /// the root `TempoApp::render` (gated on `output_menu_source ==
+    /// Some(Settings)`) so it floats over the Settings page.
     pub(super) fn settings_output_device_menu(
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let position = self.player.read(cx).output_menu_position();
-        self.menu_at(
+        let colors = *self.colors();
+        let current_output = self.player.read(cx).current_output_label();
+        menu_at(
             position,
             Corner::TopRight,
             point(px(24.0), px(18.0)),
-            self.output_device_menu(OutputMenuSource::Settings, cx),
+            settings_output_device_panel(current_output, colors, cx),
         )
     }
+}
 
-    pub(super) fn output_device_menu(
-        &self,
-        _source: OutputMenuSource,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let colors = *self.colors();
-        let current_output = self.player.read(cx).current_output_label();
-        let devices = perf::time(
-            "player.output_devices_for_menu",
-            "",
-            PlaybackController::output_devices,
-        );
+fn settings_output_device_panel(
+    current_output: String,
+    colors: ThemeColors,
+    cx: &mut Context<TempoApp>,
+) -> impl IntoElement + use<> {
+    let devices = perf::time(
+        "player.output_devices_for_menu",
+        "",
+        PlaybackController::output_devices,
+    );
 
-        self.menu_panel(260.0)
-            .child(self.menu_header_with_subtitle("Audio Output", current_output.clone()))
-            .when(devices.is_empty(), |this| {
-                this.child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_color(rgb(colors.text_muted))
-                        .child("No output devices found"),
-                )
-            })
-            .children(
-                devices
-                    .into_iter()
-                    .enumerate()
-                    .map(move |(device_ix, device)| {
-                        let selected = device.name == current_output;
-                        let label = if device.is_default {
-                            format!("{} (default)", device.name)
-                        } else {
-                            device.name.clone()
-                        };
-                        let output_name = device.name;
-
-                        self.menu_item_base(SharedString::from(format!(
-                            "output-device-{device_ix}"
-                        )))
-                        .h(px(30.0))
-                        .justify_between()
-                        .text_color(rgb(if selected {
-                            colors.accent_soft
-                        } else {
-                            colors.text
-                        }))
-                        .hover(move |this| {
-                            this.bg(rgb(colors.button_hover))
-                                .text_color(rgb(colors.text_strong))
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_output_device(output_name.clone(), cx);
-                            cx.notify();
-                        }))
-                        .child(
-                            div()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .child(label),
-                        )
-                        .child(if selected { "✓" } else { "" })
-                    }),
-            )
-    }
-
-    pub(super) fn bitrate_label(track: &Track) -> String {
-        track
-            .bitrate
-            .map(|bitrate| format!("{bitrate} kbps"))
-            .unwrap_or_else(|| "unknown bitrate".to_string())
-    }
-
-    pub(super) fn waveform_seekbar(
-        &self,
-        elapsed: SharedString,
-        duration: SharedString,
-        progress: f32,
-        waveform: Arc<[f32]>,
-        loading: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let progress_segments = (waveform.len() as f32 * progress).round() as usize;
-        let colors = *self.colors();
-
-        div()
-            .id("waveform-seekbar")
-            .absolute()
-            .top_0()
-            .right_0()
-            .bottom_0()
-            .left_0()
-            .cursor_pointer()
-            .rounded_lg()
-            .overflow_hidden()
-            .bg(rgb(colors.waveform_bg))
-            .border_1()
-            .border_color(rgb(colors.waveform_border))
-            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                if event.standard_click() {
-                    let click_x = f32::from(event.position().x);
-                    let viewport_width = f32::from(window.viewport_size().width);
-                    this.seek_from_waveform_click(click_x, viewport_width, cx);
-                    cx.notify();
-                }
-            }))
-            .child(
+    menu_panel(260.0, colors)
+        .child(menu_header_with_subtitle(
+            "Audio Output",
+            current_output.clone(),
+            colors,
+        ))
+        .when(devices.is_empty(), |this| {
+            this.child(
                 div()
-                    .absolute()
-                    .top(px(42.0))
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(rgb(colors.waveform_line)),
+                    .px_3()
+                    .py_2()
+                    .text_color(rgb(colors.text_muted))
+                    .child("No output devices found"),
             )
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .right_0()
-                    .bottom_0()
-                    .left_0()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .gap(px(1.0))
-                    // `Arc<[f32]>::iter()` borrows the slice — no clone
-                    // of the underlying buffer per frame, unlike the
-                    // prior `Vec<f32>` which was cloned per render.
-                    .children(
-                        waveform
-                            .iter()
-                            .copied()
-                            .enumerate()
-                            .map(move |(ix, height)| {
-                                Self::waveform_bar(ix, height, progress_segments, loading, colors)
-                            }),
-                    ),
-            )
-            .when(loading, |this| {
-                this.child(
-                    div()
-                        .absolute()
-                        .top_2()
-                        .left_3()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .bg(rgb(colors.waveform_bg))
-                        .text_xs()
-                        .text_color(rgb(colors.waveform_played_peak))
-                        .child("Loading waveform"),
-                )
-            })
-            .child(
-                div()
-                    .absolute()
-                    .bottom_2()
-                    .left_3()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(colors.waveform_bg))
-                    .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(elapsed),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom_2()
-                    .right_3()
-                    .px_1()
-                    .rounded_sm()
-                    .bg(rgb(colors.waveform_bg))
-                    .text_xs()
-                    .text_color(rgb(colors.text_faint))
-                    .child(duration),
-            )
-    }
+        })
+        .children(
+            devices
+                .into_iter()
+                .enumerate()
+                .map(move |(device_ix, device)| {
+                    let selected = device.name == current_output;
+                    let label = if device.is_default {
+                        format!("{} (default)", device.name)
+                    } else {
+                        device.name.clone()
+                    };
+                    let output_name = device.name;
 
-    pub(super) fn waveform_bar(
-        ix: usize,
-        height: f32,
-        progress_segments: usize,
-        loading: bool,
-        colors: ThemeColors,
-    ) -> impl IntoElement {
-        let played = ix < progress_segments;
-        let playhead = ix == progress_segments;
-        let peak = height > 44.0;
-        let color = if loading && peak {
-            colors.waveform_played
-        } else if loading {
-            colors.waveform_idle_peak
-        } else if playhead {
-            colors.waveform_playhead
-        } else if played && peak {
-            colors.waveform_played_peak
-        } else if played {
-            colors.waveform_played
-        } else if peak {
-            colors.waveform_idle_peak
-        } else {
-            colors.waveform_idle
-        };
-
-        div()
-            .flex_1()
-            .min_w(px(1.0))
-            .h(px(if playhead { 58.0 } else { height }))
-            .rounded_full()
-            .bg(rgb(color))
-            .opacity(if loading || played || playhead {
-                1.0
-            } else {
-                0.78
-            })
-    }
-
-    pub(super) fn transport_overlay(
-        &self,
-        is_playing: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let colors = *self.colors();
-        let mode_icon = self.playback_mode_icon(cx);
-        let mode_active = self.player.read(cx).playback_mode() != PlaybackMode::Straight;
-
-        div()
-            .relative()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded_full()
-            .bg(rgb(colors.app))
-            .border_1()
-            .border_color(rgb(colors.waveform_border))
-            .child(
-                self.transport_button(mode_icon, false, mode_active)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cycle_playback_mode(cx);
+                    menu_item_base(
+                        SharedString::from(format!("settings-output-device-{device_ix}")),
+                        colors,
+                    )
+                    .h(px(30.0))
+                    .justify_between()
+                    .text_color(rgb(if selected {
+                        colors.accent_soft
+                    } else {
+                        colors.text
+                    }))
+                    .hover(move |this| {
+                        this.bg(rgb(colors.button_hover))
+                            .text_color(rgb(colors.text_strong))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_output_device(output_name.clone(), cx);
                         cx.notify();
-                    })),
-            )
-            .child(
-                self.transport_button("◀", false, false)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_adjacent_track(-1, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                self.transport_button(if is_playing { "Ⅱ" } else { "▶" }, true, false)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_playback(cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                self.transport_button("▶", false, false)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_adjacent_track(1, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                self.transport_button("↻", false, false)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_random_track(cx);
-                        cx.notify();
-                    })),
-            )
-    }
-
-    pub(super) fn transport_button(
-        &self,
-        label: &'static str,
-        primary: bool,
-        active: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let size = if primary { 28.0 } else { 22.0 };
-        let hover_size = if primary { 32.0 } else { 26.0 };
-        let colors = *self.colors();
-        let bg = if primary {
-            colors.transport_primary_bg
-        } else if active {
-            colors.text_strong
-        } else {
-            colors.player
-        };
-        let fg = if primary {
-            colors.transport_primary_fg
-        } else if active {
-            colors.app
-        } else {
-            colors.text_muted
-        };
-
-        div()
-            .id(SharedString::from(format!("transport-{label}-{primary}")))
-            .w(px(size))
-            .h(px(size))
-            .rounded_full()
-            .bg(rgb(bg))
-            .text_color(rgb(fg))
-            .cursor_pointer()
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_xs()
-            .font_weight(gpui::FontWeight::BOLD)
-            .hover(move |this| {
-                this.w(px(hover_size))
-                    .h(px(hover_size))
-                    .bg(rgb(colors.text_strong))
-                    .text_color(rgb(colors.app))
-            })
-            .child(label)
-    }
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(label),
+                    )
+                    .child(if selected { "✓" } else { "" })
+                }),
+        )
 }

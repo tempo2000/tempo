@@ -73,8 +73,24 @@ use std::time::Instant;
 /// All variants are `Clone` so a single subscriber can fan them out to
 /// multiple internal handlers; the events themselves are cheap (paths
 /// are `PathBuf` clones, ~40 bytes).
+///
+/// The variants split into two conceptual groups:
+///
+/// 1. **State-change notifications** — `PlayingTrackChanged`,
+///    `IsPlayingChanged`, `TrackFinished`, `StateMutated`. The parent
+///    reacts (rerender, save, auto-advance). Emitted by player methods
+///    after state mutation.
+/// 2. **Command requests** — `NowPlayingLinkClicked`,
+///    `RequestPlayPause`, `RequestPlayPrev`, `RequestPlayNext`,
+///    `RequestPlayRandom`, `RequestSeekFromWaveformClick`,
+///    `RequestSelectOutputDevice`. Emitted by user clicks inside the
+///    player bar that need cross-region work (tab opening, track
+///    resolution from the active tab's index list, etc.). The parent
+///    handles the cross-region bits and calls back into the player
+///    via direct `update`.
 #[derive(Debug, Clone)]
 pub(crate) enum PlayerEvent {
+    // === State-change notifications ===
     /// The currently-playing track changed (or playback stopped, in
     /// which case `path` is `None`). The parent rerenders so table /
     /// history active-row highlights update.
@@ -93,14 +109,45 @@ pub(crate) enum PlayerEvent {
     /// any stop/seek it issued itself.
     TrackFinished { finished_path: PathBuf },
 
-    /// The user clicked one of the title/artist/album labels in the
-    /// Now-Playing strip. The parent opens the corresponding tab.
-    NowPlayingLinkClicked { kind: NowPlayingLink, path: PathBuf },
-
     /// State that should be persisted has changed (volume committed
     /// after drag, output device chosen, playback mode cycled, etc.).
     /// The parent calls `save_app_state()` which is itself debounced.
     StateMutated,
+
+    // === Command requests ===
+    /// The user clicked one of the title/artist/album labels in the
+    /// Now-Playing strip. The parent opens the corresponding tab.
+    NowPlayingLinkClicked { kind: NowPlayingLink, path: PathBuf },
+
+    /// Transport play/pause clicked. The parent calls
+    /// `TempoApp::toggle_playback(cx)` which has the smart
+    /// pause/resume/restart logic that needs `tracks`.
+    RequestPlayPause,
+
+    /// Transport previous (◀) clicked. Parent resolves the previous
+    /// track from `current_track_indices()` and calls
+    /// `play_track_with_history`.
+    RequestPlayPrev,
+
+    /// Transport next (▶) clicked.
+    RequestPlayNext,
+
+    /// Transport shuffle (↻) clicked. Parent picks a random track via
+    /// `current_track_indices()` and `shuffle_key`.
+    RequestPlayRandom,
+
+    /// User clicked the waveform seekbar. `ratio` is the click's
+    /// position along the seekbar in `0.0..=1.0`, computed from the
+    /// seekbar's actual painted bounds (so it stays correct across
+    /// window resizes). Parent computes the seek target via the
+    /// currently-playing track's `duration_value` and handles
+    /// backend-empty recovery.
+    RequestSeekFromWaveformClick { ratio: f32 },
+
+    /// User picked an output device from the dropdown. Parent
+    /// switches the audio backend; if playback was active, it
+    /// restarts the current track.
+    RequestSelectOutputDevice(String),
 }
 
 /// The audio playback subsystem entity.
@@ -141,6 +188,13 @@ pub(crate) struct PlayerEntity {
     /// emits one [`PlayerEvent::StateMutated`] when the drag ends.
     pub(super) volume_dragging: bool,
     pub(super) volume_bar_scroll_handle: gpui::ScrollHandle,
+    /// Tracks the painted bounds of the waveform seekbar so click
+    /// handling can compute a ratio against the actual rendered
+    /// width — relying on `window.viewport_size()` plus the fixed
+    /// player-bar layout constants gave wrong answers immediately
+    /// after a window resize, since the seekbar's `flex_1` width is
+    /// the only piece of the bar that grows with the viewport.
+    pub(super) waveform_seekbar_scroll_handle: gpui::ScrollHandle,
 
     // === Output device picker ===
     /// Saved/preferred output device name, persisted to app state.
@@ -182,9 +236,81 @@ pub(crate) struct PlayerEntity {
     /// owning our own handle keeps the waveform-decode hot path
     /// independent of `app.update` and avoids re-entrancy.
     pub(super) catalog: Option<CatalogStore>,
+
+    // === Render snapshot ===
+    /// Snapshot of the currently-playing track's render-relevant
+    /// fields, pushed by `TempoApp` after each `play_track`. `None`
+    /// means "library has tracks but the player hasn't been told
+    /// which is current" — should not happen at steady state, but
+    /// defensively rendered as the empty placeholder.
+    ///
+    /// Crucially, this lets `PlayerEntity::render` execute without
+    /// borrowing the parent's `tracks` `Vec`, which is what enables
+    /// the entity to be embedded as a child element with localized
+    /// per-frame invalidation.
+    pub(super) playing_track: Option<PlayingTrackSnapshot>,
+    /// Snapshot of [`ThemeColors`], updated on theme change. Copied
+    /// (not borrowed) because `ThemeColors: Copy` and the parent's
+    /// theme list shouldn't outlive theme reloads.
+    pub(super) theme_colors: ThemeColors,
 }
 
 impl gpui::EventEmitter<PlayerEvent> for PlayerEntity {}
+
+/// Snapshot of a [`Track`]'s render-relevant fields, pushed onto
+/// [`PlayerEntity`] by `TempoApp` after each successful `play_track`
+/// (or after library reload, theme change, etc.). The player's render
+/// path consumes this snapshot directly so it doesn't need a borrow
+/// of the parent's `tracks` `Vec` — that's the foundation that lets
+/// `Entity<PlayerEntity>` be embedded as a child element and have its
+/// per-frame ticks invalidate *only* the player bar.
+///
+/// All fields are cheap to clone:
+/// - `SharedString` is `Arc<str>` (refcount bump).
+/// - `PathBuf` is ~40 bytes.
+/// - `TrackArtwork::Embedded(Arc<Image>)` is a refcount bump;
+///   `TrackArtwork::File(PathBuf)` is also cheap.
+/// - `album_initials` is the only owned `String` (1–2 chars).
+///
+/// The snapshot is updated wholesale (not field-by-field) on every
+/// track change. Theme changes update `colors` independently via
+/// [`PlayerEntity::set_theme_colors`].
+#[derive(Clone)]
+pub(crate) struct PlayingTrackSnapshot {
+    pub(crate) path: PathBuf,
+    pub(crate) title: SharedString,
+    pub(crate) artist: SharedString,
+    pub(crate) album: SharedString,
+    pub(crate) year: SharedString,
+    pub(crate) codec: SharedString,
+    pub(crate) duration: SharedString,
+    pub(crate) duration_value: Duration,
+    pub(crate) bitrate: Option<u32>,
+    pub(crate) artwork: Option<TrackArtwork>,
+    pub(crate) album_initials: String,
+    pub(crate) album_color: u32,
+}
+
+impl PlayingTrackSnapshot {
+    /// Capture a snapshot from a `Track`. All fields are cheap clones
+    /// (`SharedString`/`Arc`/short `String`s).
+    pub(crate) fn from_track(track: &Track) -> Self {
+        Self {
+            path: track.path.clone(),
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            album: track.album.clone(),
+            year: track.year.clone(),
+            codec: track.codec.clone(),
+            duration: track.duration.clone(),
+            duration_value: track.duration_value,
+            bitrate: track.bitrate,
+            artwork: track.artwork.clone(),
+            album_initials: track.album_initials.clone(),
+            album_color: track.album_color,
+        }
+    }
+}
 
 /// Outcome of a [`PlayerEntity::seek_from_waveform_click`] call,
 /// describing what (if anything) the parent needs to do to recover.
@@ -218,6 +344,7 @@ impl PlayerEntity {
         initial_volume: f32,
         initial_output_device: Option<String>,
         catalog: Option<CatalogStore>,
+        theme_colors: ThemeColors,
         _cx: &mut Context<Self>,
     ) -> Self {
         let volume = initial_volume.clamp(0.0, 1.0);
@@ -231,6 +358,7 @@ impl PlayerEntity {
             pre_mute_volume: if volume > 0.0 { volume } else { 1.0 },
             volume_dragging: false,
             volume_bar_scroll_handle: gpui::ScrollHandle::new(),
+            waveform_seekbar_scroll_handle: gpui::ScrollHandle::new(),
             output_device: initial_output_device,
             output_menu_source: None,
             output_menu_position: Point::default(),
@@ -240,6 +368,26 @@ impl PlayerEntity {
             waveform_cache: HashMap::new(),
             waveform_loading: HashSet::new(),
             catalog,
+            playing_track: None,
+            theme_colors,
+        }
+    }
+
+    /// Push the currently-playing track snapshot. Called by
+    /// `TempoApp` after each successful `play_track` and after
+    /// library reloads (so the new `tracks[0]` shows in the player
+    /// bar). Setting to `None` reverts to the empty placeholder.
+    pub(crate) fn set_playing_track(&mut self, snapshot: Option<PlayingTrackSnapshot>) {
+        self.playing_track = snapshot;
+    }
+
+    /// Push the active theme colors. `ThemeColors: Copy` so this is
+    /// a single 32-byte memcpy. Called from the parent's
+    /// `set_theme` and at startup.
+    pub(crate) fn set_theme_colors(&mut self, colors: ThemeColors, cx: &mut Context<Self>) {
+        if self.theme_colors != colors {
+            self.theme_colors = colors;
+            cx.notify();
         }
     }
 
@@ -643,16 +791,11 @@ impl PlayerEntity {
     /// an empty-backend seek without a fragile post-hoc state check.
     pub(crate) fn seek_from_waveform_click(
         &mut self,
-        click_x: f32,
-        viewport_width: f32,
+        ratio: f32,
         track_duration: Duration,
         cx: &mut Context<Self>,
     ) -> SeekClickOutcome {
-        let waveform_left = PLAYER_BAR_PAD + PLAYER_ART_W + PLAYER_GAP + PLAYER_INFO_W + PLAYER_GAP;
-        let waveform_right = viewport_width - (PLAYER_GAP + PLAYER_CONTROLS_W + PLAYER_BAR_PAD);
-        let waveform_width = (waveform_right - waveform_left).max(1.0);
-        let ratio = ((click_x - waveform_left) / waveform_width).clamp(0.0, 1.0);
-        let target = track_duration.mul_f32(ratio);
+        let target = track_duration.mul_f32(ratio.clamp(0.0, 1.0));
 
         let needs_restart = !self.seek(target, cx);
         SeekClickOutcome {
@@ -859,7 +1002,11 @@ impl PlayerEntity {
     }
 
     /// Read accessor for the player bar render path — which output
-    /// menu is currently open, if any.
+    /// menu is currently open, if any. Used by `TempoApp::render` to
+    /// decide whether to render the *Settings*-anchored variant of
+    /// the dropdown (the player-anchored variant is rendered inside
+    /// `PlayerEntity::render` itself).
+    #[allow(dead_code)]
     pub(crate) fn output_menu_source(&self) -> Option<OutputMenuSource> {
         self.output_menu_source
     }
@@ -885,6 +1032,10 @@ impl PlayerEntity {
         self.alt_pressed = alt;
     }
 
+    /// Currently unused — `PlayerEntity::render` reads
+    /// `self.now_playing_info_hovered` directly. Kept for
+    /// inspector/debug callers.
+    #[allow(dead_code)]
     pub(crate) fn now_playing_info_hovered(&self) -> bool {
         self.now_playing_info_hovered
     }
