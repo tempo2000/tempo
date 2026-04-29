@@ -149,13 +149,20 @@ impl TempoApp {
     /// serialize + I/O work is performed by the background save thread,
     /// so the snapshot itself is the only cost paid on the UI thread.
     pub(super) fn build_app_state_snapshot(&self) -> AppState {
+        // `volume_snapshot` and `output_device_snapshot` are mirrors
+        // of authoritative state on `self.player`, kept here so the
+        // snapshot can be built from `&self` only — that lets the
+        // dozens of `save_app_state()` callsites scattered across
+        // settings/playlist/tab mutations stay one-arg. The mirrors
+        // are refreshed in `handle_player_event` whenever
+        // `PlayerEvent::StateMutated` fires.
         AppState {
             library_roots: self.library_roots.clone(),
             playlists: self.playlists.clone(),
             theme_id: self.theme_id.clone(),
-            output_device: self.output_device.clone(),
+            output_device: self.output_device_snapshot.clone(),
             online_metadata_mode: self.online_metadata_mode,
-            volume: self.volume,
+            volume: self.volume_snapshot,
             visible_table_columns: self.visible_columns.clone(),
             page: self.page,
             tabs: self.saved_tabs(),
@@ -271,7 +278,8 @@ impl TempoApp {
             perf::time("library.restart_watcher.stop_old", "", || watcher.stop());
         }
 
-        self.stop_current_playback();
+        self.player
+            .update(cx, |player, cx| player.reset_for_library_reload(cx));
         self.library_root_label = Self::library_root_label(&self.library_roots);
         self.tracks = perf::time(
             "library.restart_watcher.load_cached_tracks",
@@ -287,8 +295,6 @@ impl TempoApp {
             self.reload_catalog_browse_data()
         });
         self.queue.clear();
-        self.waveform_cache.clear();
-        self.waveform_loading.clear();
         perf::time(
             "library.restart_watcher.rebuild_indices",
             format!("tracks={}", self.tracks.len()),
@@ -298,7 +304,6 @@ impl TempoApp {
             tab.selected_track = 0;
         }
         self.playing_track = 0;
-        self.is_playing = false;
         self.context_menu_track = None;
         self.scan_progress = ScanProgress::default();
         self.is_scanning = false;
@@ -406,7 +411,7 @@ impl TempoApp {
                     if this
                         .update(cx, |app, cx| {
                             for event in pending_events {
-                                app.apply_library_event(event);
+                                app.apply_library_event(event, cx);
                             }
                             cx.notify();
                         })
@@ -743,7 +748,7 @@ impl TempoApp {
         }
     }
 
-    pub(super) fn apply_library_event(&mut self, event: LibraryEvent) {
+    pub(super) fn apply_library_event(&mut self, event: LibraryEvent, cx: &mut Context<Self>) {
         match event {
             LibraryEvent::ScanStarted => {
                 perf::event(
@@ -773,6 +778,12 @@ impl TempoApp {
                 let apply_start = Instant::now();
                 let indexed_count = tracks.len();
                 self.scan_changed_tracks = self.scan_changed_tracks || indexed_count > 0;
+                // Paths whose waveform cache entries were superseded
+                // by a fresh scan record. Invalidated in one
+                // `player.update` at the end of the loop instead of
+                // borrowing the player entity inside the hot-path
+                // upsert loop.
+                let mut waveforms_to_invalidate: Vec<PathBuf> = Vec::new();
                 for track in tracks {
                     let track = Track::from(track);
                     // O(1) reverse lookup via `track_path_index` instead of
@@ -787,22 +798,22 @@ impl TempoApp {
                         self.library_size_bytes = self.library_size_bytes.saturating_sub(old_size);
                         self.library_size_bytes =
                             self.library_size_bytes.saturating_add(track.file_size);
+                        waveforms_to_invalidate.push(track.path.clone());
                         self.tracks[existing_ix] = track;
-                        if existing_ix < self.waveform_cache.len() {
-                            self.waveform_cache[existing_ix] = None;
-                        }
-                        if existing_ix < self.waveform_loading.len() {
-                            self.waveform_loading[existing_ix] = false;
-                        }
                     } else {
                         let new_ix = self.tracks.len();
                         self.track_path_index.insert(track.path.clone(), new_ix);
                         self.library_size_bytes =
                             self.library_size_bytes.saturating_add(track.file_size);
                         self.tracks.push(track);
-                        self.waveform_cache.push(None);
-                        self.waveform_loading.push(false);
                     }
+                }
+                if !waveforms_to_invalidate.is_empty() {
+                    self.player.update(cx, |player, _| {
+                        for path in &waveforms_to_invalidate {
+                            player.invalidate_waveform_for_path(path);
+                        }
+                    });
                 }
 
                 let rebuild_start = Instant::now();
@@ -814,7 +825,7 @@ impl TempoApp {
                     format!("tracks={} tabs={}", self.tracks.len(), self.tabs.len()),
                 );
                 let clamp_start = Instant::now();
-                self.clamp_track_indices();
+                self.clamp_track_indices(cx);
                 perf::log_duration_if_slow(
                     "scan.tracks_indexed.clamp_indices",
                     clamp_start.elapsed(),
@@ -836,7 +847,7 @@ impl TempoApp {
             }
             LibraryEvent::TrackRemoved(path) => {
                 let remove_start = Instant::now();
-                self.apply_removed_track_paths(vec![path.clone()]);
+                self.apply_removed_track_paths(vec![path.clone()], cx);
                 perf::log_duration(
                     "scan.track_removed.apply",
                     remove_start.elapsed(),
@@ -845,7 +856,7 @@ impl TempoApp {
             }
             LibraryEvent::TracksRemoved(paths) => {
                 let remove_start = Instant::now();
-                let removed_count = self.apply_removed_track_paths(paths);
+                let removed_count = self.apply_removed_track_paths(paths, cx);
                 perf::log_duration(
                     "scan.tracks_removed.apply",
                     remove_start.elapsed(),
@@ -872,14 +883,14 @@ impl TempoApp {
                     self.tracks = tracks;
                     self.track_path_index = build_track_path_index(&self.tracks);
                     self.library_size_bytes = self.tracks.iter().map(|track| track.file_size).sum();
-                    self.waveform_cache.clear();
-                    self.waveform_loading.clear();
+                    self.player
+                        .update(cx, |player, _| player.clear_waveform_cache());
                     self.invalidate_track_indices();
                 }
                 if changed {
                     self.reload_catalog_browse_data();
                 }
-                self.clamp_track_indices();
+                self.clamp_track_indices(cx);
                 self.is_scanning = false;
                 self.last_scan_browse_reload = None;
                 self.library_status = Self::scan_status(self.scan_progress, false);
@@ -902,7 +913,7 @@ impl TempoApp {
         }
     }
 
-    fn apply_removed_track_paths(&mut self, paths: Vec<PathBuf>) -> usize {
+    fn apply_removed_track_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) -> usize {
         if paths.is_empty() {
             return 0;
         }
@@ -922,16 +933,19 @@ impl TempoApp {
         self.scan_changed_tracks = true;
         removed_indices.sort_unstable_by(|left, right| right.cmp(left));
 
+        // Drop the player's waveform cache entries for the removed
+        // tracks. The cache is keyed by path so this is independent
+        // of the index shifting that follows in the track-list mutation.
+        self.player.update(cx, |player, _| {
+            for path in &removed_paths {
+                player.invalidate_waveform_for_path(path);
+            }
+        });
+
         for ix in &removed_indices {
             let removed_size = self.tracks[*ix].file_size;
             self.library_size_bytes = self.library_size_bytes.saturating_sub(removed_size);
             self.tracks.remove(*ix);
-            if *ix < self.waveform_cache.len() {
-                self.waveform_cache.remove(*ix);
-            }
-            if *ix < self.waveform_loading.len() {
-                self.waveform_loading.remove(*ix);
-            }
             self.remove_track_from_queue(*ix);
         }
         // Removals shift every subsequent track's index, so the reverse
@@ -942,7 +956,7 @@ impl TempoApp {
 
         self.invalidate_track_indices();
         self.reload_catalog_browse_data();
-        self.clamp_track_indices();
+        self.clamp_track_indices(cx);
         self.library_status = Self::scan_status(self.scan_progress, self.is_scanning);
         if !self.is_scanning {
             self.spawn_snapshot_rebuild("tracks_removed");

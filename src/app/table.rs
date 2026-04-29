@@ -1102,6 +1102,9 @@ impl TempoApp {
             && self.active_source_track_count() > 0
             && !active_search_query.trim().is_empty();
         let table_scroll_handle = self.active_tab().table_scroll_handle.clone();
+        // Captured once per frame so the per-row "Ⅱ vs ▶" cell can be
+        // rendered without each row issuing its own `self.player.read(cx)`.
+        let is_playing = self.player.read(cx).is_playing();
 
         div()
             .flex_1()
@@ -1155,7 +1158,7 @@ impl TempoApp {
                     .min_h_0()
                     .relative()
                     .when(self.table_scrollbar_drag.is_some(), |this| {
-                        this.child(self.render_fast_scroll_rows())
+                        this.child(self.render_fast_scroll_rows(is_playing))
                     })
                     .when(self.table_scrollbar_drag.is_none(), |this| {
                         this.child(
@@ -1186,6 +1189,7 @@ impl TempoApp {
                                                     visible_row_ix,
                                                     track_ix,
                                                     &this.tracks[track_ix],
+                                                    is_playing,
                                                     this.table_is_scrolling,
                                                     cx,
                                                 )
@@ -1267,7 +1271,7 @@ impl TempoApp {
             })
     }
 
-    pub(super) fn render_fast_scroll_rows(&self) -> AnyElement {
+    pub(super) fn render_fast_scroll_rows(&self, is_playing: bool) -> AnyElement {
         let Some(metrics) = self.table_scrollbar_metrics() else {
             return div().size_full().into_any_element();
         };
@@ -1288,7 +1292,7 @@ impl TempoApp {
                 let row_ix = start_row + visible_ix;
                 let track_ix = *indices.get(row_ix)?;
                 let top = first_row_top + visible_ix as f32 * TABLE_ROW_H;
-                Some(self.render_fast_track_row(top, track_ix, &self.tracks[track_ix]))
+                Some(self.render_fast_track_row(top, track_ix, &self.tracks[track_ix], is_playing))
             })
             .collect::<Vec<_>>();
 
@@ -1309,6 +1313,7 @@ impl TempoApp {
         top: f32,
         track_ix: usize,
         track: &Track,
+        is_playing: bool,
     ) -> AnyElement {
         let active = track_ix == self.playing_track;
         let selected = track_ix == self.active_selected_track();
@@ -1339,12 +1344,9 @@ impl TempoApp {
                     .items_center()
                     .ml(px(-self.current_table_horizontal_scroll()))
                     .w(px(self.table_render_width()))
-                    .children(
-                        self.visible_columns
-                            .iter()
-                            .copied()
-                            .map(|column| self.track_cell(column, track_ix, track, active, true)),
-                    ),
+                    .children(self.visible_columns.iter().copied().map(|column| {
+                        self.track_cell(column, track_ix, track, active, is_playing, true)
+                    })),
             )
             .into_any_element()
     }
@@ -1829,6 +1831,7 @@ impl TempoApp {
         _row_ix: usize,
         track_ix: usize,
         track: &Track,
+        is_playing: bool,
         lightweight: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1874,7 +1877,7 @@ impl TempoApp {
                         }
 
                         if event.standard_click() && event.click_count() >= 2 {
-                            this.play_track(track_ix);
+                            this.play_track(track_ix, cx);
                         }
 
                         cx.notify();
@@ -1905,7 +1908,7 @@ impl TempoApp {
                     .ml(px(-self.current_table_horizontal_scroll()))
                     .w(px(self.table_render_width()))
                     .children(self.visible_columns.iter().copied().map(|column| {
-                        self.track_cell(column, track_ix, track, active, lightweight)
+                        self.track_cell(column, track_ix, track, active, is_playing, lightweight)
                     })),
             )
     }
@@ -1925,6 +1928,7 @@ impl TempoApp {
         track_ix: usize,
         track: &Track,
         active: bool,
+        is_playing: bool,
         lightweight: bool,
     ) -> AnyElement {
         let colors = *self.colors();
@@ -1935,7 +1939,7 @@ impl TempoApp {
                 .text_xs()
                 .text_color(rgb(colors.text_faint))
                 .child(if active {
-                    if self.is_playing { "Ⅱ" } else { "▶" }.into()
+                    if is_playing { "Ⅱ" } else { "▶" }.into()
                 } else {
                     format!("{:02}", track_ix + 1)
                 })
@@ -2260,7 +2264,7 @@ impl TempoApp {
                     self.context_menu_item("Play from start")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if track_ix < this.tracks.len() {
-                                this.play_track(track_ix);
+                                this.play_track(track_ix, cx);
                                 cx.notify();
                             }
                         })),

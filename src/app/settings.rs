@@ -294,7 +294,7 @@ impl TempoApp {
                             .text_color(rgb(colors.text_muted))
                             .overflow_hidden()
                             .text_ellipsis()
-                            .child(self.current_output_label()),
+                            .child(self.player.read(cx).current_output_label()),
                     ),
             )
             .child(

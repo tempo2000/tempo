@@ -1,139 +1,121 @@
+//! Player module — owns the [`PlayerEntity`] and all rendering /
+//! state-mutation code for the player bar (transport, waveform,
+//! volume, output device picker).
+//!
+//! See [`entity`] for the architectural design notes. This file has
+//! two purposes:
+//!
+//! 1. **Render the player bar** — transport, waveform seekbar,
+//!    Now-Playing strip, volume, output picker. Rendering reads from
+//!    `self.player.read(cx)` and binds clicks/hovers via
+//!    `self.player.update(cx, |p, cx| p.foo(...))`. The render code
+//!    still lives on `TempoApp` (not `PlayerEntity::render`) because
+//!    it needs the active track's metadata from `self.tracks` to
+//!    paint the title/artist/album marquees and the album tile.
+//!
+//!    Deferring the move of `render_player_bar` onto `PlayerEntity`
+//!    itself avoids duplicating the `Track` lookup logic; once the
+//!    `PlayerEntity` carries enough metadata (via
+//!    [`PlayerEvent::PlayingTrackChanged`] payload extension or a
+//!    push from `TempoApp` after `play_track`), this can move
+//!    wholesale.
+//!
+//! 2. **TempoApp glue methods** — `play_track`, `play_finished_track`,
+//!    `play_random_track`, `play_adjacent_track`, `queue_*`,
+//!    `seek_playback_to`, etc. These do cross-region bookkeeping
+//!    (play counts, history, queue, tabs) and then delegate the
+//!    audio-side work to `PlayerEntity` via `self.player.update`.
+
 use super::*;
 use std::time::Instant;
 
+mod entity;
+
+pub(super) use entity::{PlayerEntity, PlayerEvent};
+
+// ============================================================================
+// TempoApp glue methods — orchestration that touches both player state
+// (audio backend) and parent state (tracks, queue, history, tabs).
+// ============================================================================
+
 impl TempoApp {
-    fn render_marquee_text(
-        text: SharedString,
-        animation_id: impl Into<SharedString>,
-        available_width: f32,
-        average_char_width: f32,
-        color: u32,
-    ) -> AnyElement {
-        let text_width = (text.chars().count() as f32 * average_char_width).max(1.0);
-
-        if text_width <= available_width {
-            return div()
-                .w_full()
-                .overflow_hidden()
-                .whitespace_nowrap()
-                .text_color(rgb(color))
-                .child(text)
-                .into_any_element();
+    /// Single subscriber callback wired in `TempoApp::new`. Translates
+    /// each [`PlayerEvent`] into the right cross-region update on
+    /// `TempoApp`. Keeping this one method keeps the event vocabulary
+    /// visible in one place; new variants get a new arm here.
+    pub(super) fn handle_player_event(&mut self, event: &PlayerEvent, cx: &mut Context<Self>) {
+        match event {
+            PlayerEvent::PlayingTrackChanged { path } => {
+                if let Some(path) = path {
+                    if let Some(&ix) = self.track_path_index.get(path) {
+                        self.playing_track = ix;
+                    }
+                }
+                cx.notify();
+            }
+            PlayerEvent::IsPlayingChanged(is_playing) => {
+                // Table active-row transport icon (Ⅱ vs ▶) and the
+                // play-count column need to repaint.
+                perf::event(
+                    "player.is_playing_changed",
+                    format!("is_playing={is_playing}"),
+                );
+                cx.notify();
+            }
+            PlayerEvent::TrackFinished { finished_path } => {
+                let is_finished_path = self
+                    .player
+                    .read(cx)
+                    .playing_track_path()
+                    .is_some_and(|current| current == finished_path.as_path());
+                if !is_finished_path {
+                    // The user already moved on (manual skip) — ignore
+                    // the stale auto-advance.
+                    return;
+                }
+                self.play_finished_track(cx);
+            }
+            PlayerEvent::NowPlayingLinkClicked { kind, path } => {
+                let Some(&track_ix) = self.track_path_index.get(path) else {
+                    // Track was removed from library while it kept
+                    // playing — silently drop the click.
+                    return;
+                };
+                match kind {
+                    NowPlayingLink::Title => self.select_track_in_all_music(track_ix),
+                    NowPlayingLink::Artist => self.open_artist_tab_for_track(track_ix),
+                    NowPlayingLink::Album => self.open_album_tab_for_track(track_ix),
+                }
+                cx.notify();
+            }
+            PlayerEvent::StateMutated => {
+                self.refresh_player_state_snapshot(cx);
+                self.save_app_state();
+            }
         }
-
-        let gap = 44.0;
-        let scroll_distance = text_width + gap;
-        let duration = Duration::from_millis(((scroll_distance / 18.0).max(7.0) * 1000.0) as u64);
-
-        div()
-            .w_full()
-            .overflow_hidden()
-            .text_color(rgb(color))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .child(div().w(px(text_width)).flex_none().child(text.clone()))
-                    .child(div().w(px(gap)).flex_none())
-                    .child(div().w(px(text_width)).flex_none().child(text))
-                    .with_animation(
-                        animation_id.into(),
-                        Animation::new(duration).repeat(),
-                        move |this, delta| this.ml(px(-scroll_distance * delta)),
-                    ),
-            )
-            .into_any_element()
     }
 
-    /// Initialize playback off the main startup path. Output device
-    /// enumeration on cpal can take 25–50 ms, and rodio has to acquire the
-    /// stream lock; doing it eagerly delays the first frame for no UI
-    /// benefit (no track is playing yet). On systems without an audio
-    /// device, the failure surfaces in the status bar a moment later
-    /// instead of blocking the window.
-    pub(super) fn start_deferred_playback_init(&self, cx: &mut Context<Self>) {
-        let preferred_output = self.output_device.clone();
-        let volume = self.volume;
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    perf::time_result("startup.playback_init_deferred", "", || {
-                        PlaybackController::new(preferred_output.as_deref(), volume)
-                    })
-                })
-                .await;
+    /// Refresh the denormalized `volume_snapshot` and
+    /// `output_device_snapshot` mirrors from authoritative
+    /// [`PlayerEntity`] state. Called after every
+    /// [`PlayerEvent::StateMutated`] and once more at shutdown via the
+    /// `on_app_quit` hook so the final save is consistent.
+    pub(super) fn refresh_player_state_snapshot(&mut self, cx: &gpui::App) {
+        let player = self.player.read(cx);
+        self.volume_snapshot = player.volume();
+        self.output_device_snapshot = player.output_device().map(str::to_string);
+    }
 
-            let _ = this.update(cx, |app, cx| match result {
-                Ok(playback) => {
-                    let device_label = playback.output_name().to_string();
-                    app.playback = Some(playback);
-                    app.output_device = Some(device_label);
-                    app.playback_status = "Audio output ready".to_string();
-                    cx.notify();
-                }
-                Err(error) => {
-                    app.playback_status = format!("Playback unavailable: {error:#}");
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+    pub(super) fn start_deferred_playback_init(&self, cx: &mut Context<Self>) {
+        self.player.update(cx, |player, player_cx| {
+            player.start_deferred_init(player_cx)
+        });
     }
 
     pub(super) fn start_playback_tick(&self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            // Track the last broadcast position in whole seconds so we
-            // only notify when the visible progress label actually
-            // changes. The waveform highlight + progress bar update at
-            // the same coarse granularity, so finer-grained ticks
-            // produced no visible difference but forced the entire root
-            // view to re-render four times a second.
-            let mut last_emitted_seconds: i64 = -1;
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-
-                if this
-                    .update(cx, |app, cx| {
-                        if !app.is_playing {
-                            return;
-                        }
-
-                        let playback_finished = app
-                            .playback
-                            .as_ref()
-                            .is_some_and(|playback| playback.is_empty());
-
-                        if playback_finished {
-                            app.play_finished_track();
-                            // Track transitions always need a repaint;
-                            // reset the throttle so the next render
-                            // doesn't compare against a stale time.
-                            last_emitted_seconds = -1;
-                            cx.notify();
-                            return;
-                        }
-
-                        let current_seconds = app
-                            .playback
-                            .as_ref()
-                            .map(|playback| playback.position().as_secs() as i64)
-                            .unwrap_or(0);
-                        if current_seconds != last_emitted_seconds {
-                            last_emitted_seconds = current_seconds;
-                            cx.notify();
-                        }
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        })
-        .detach();
+        self.player.update(cx, |player, player_cx| {
+            player.start_playback_tick(player_cx)
+        });
     }
 
     pub(super) fn remove_track_from_queue(&mut self, removed_ix: usize) {
@@ -220,14 +202,21 @@ impl TempoApp {
         hash ^ (hash >> 33)
     }
 
-    pub(super) fn clamp_track_indices(&mut self) {
+    pub(super) fn clamp_track_indices(&mut self, cx: &mut Context<Self>) {
         if self.tracks.is_empty() {
             for tab in &mut self.tabs {
                 tab.selected_track = 0;
             }
             self.playing_track = 0;
             self.context_menu_track = None;
-            self.is_playing = false;
+            // The previous monolithic implementation merely flipped
+            // `is_playing = false` without stopping the audio
+            // backend; calling `player.stop()` here also drains the
+            // rodio sink, so a subsequent `restart_library_watcher`
+            // doesn't leave half-decoded audio queued. This matches
+            // user expectations ("library is empty, so should be
+            // silent").
+            self.player.update(cx, |player, cx| player.stop(cx));
             return;
         }
 
@@ -254,11 +243,16 @@ impl TempoApp {
         self.queue.retain(|track_ix| *track_ix <= last);
     }
 
-    pub(super) fn play_track(&mut self, track_ix: usize) {
-        self.play_track_with_history(track_ix, true);
+    pub(super) fn play_track(&mut self, track_ix: usize, cx: &mut Context<Self>) {
+        self.play_track_with_history(track_ix, true, cx);
     }
 
-    pub(super) fn play_track_with_history(&mut self, track_ix: usize, record_history: bool) {
+    pub(super) fn play_track_with_history(
+        &mut self,
+        track_ix: usize,
+        record_history: bool,
+        cx: &mut Context<Self>,
+    ) {
         let start = Instant::now();
         let Some(track) = self.tracks.get(track_ix) else {
             return;
@@ -269,35 +263,30 @@ impl TempoApp {
         self.set_active_selected_track(track_ix);
         self.context_menu_track = None;
 
-        let Some(playback) = &self.playback else {
-            self.is_playing = false;
-            return;
-        };
+        let result = self.player.update(cx, |player, cx| {
+            player.start_playback(track_path.clone(), cx)
+        });
 
-        match playback.play_path(&track_path) {
-            Ok(()) => {
-                let plays = perf::time(
-                    "player.increment_play_count",
-                    format!("path={}", track_path.display()),
-                    || {
-                        self.catalog
-                            .as_ref()
-                            .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
-                            .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1))
-                    },
-                );
-                if let Some(track) = self.tracks.get_mut(track_ix) {
-                    track.plays = plays;
-                }
-                if record_history {
-                    self.record_playback_history(track_ix);
-                }
-                self.is_playing = true;
-                self.playback_status = "Playing".to_string();
+        if result.is_ok() {
+            // Increment play count via catalog (authoritative across
+            // restarts) with an in-memory fallback. Then mirror the
+            // count onto the in-memory `Track` so the table column
+            // reflects it without a query round-trip.
+            let plays = perf::time(
+                "player.increment_play_count",
+                format!("path={}", track_path.display()),
+                || {
+                    self.catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
+                        .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1))
+                },
+            );
+            if let Some(track) = self.tracks.get_mut(track_ix) {
+                track.plays = plays;
             }
-            Err(error) => {
-                self.is_playing = false;
-                self.playback_status = format!("Playback failed: {error:#}");
+            if record_history {
+                self.record_playback_history(track_ix);
             }
         }
         perf::log_duration(
@@ -310,175 +299,108 @@ impl TempoApp {
         );
     }
 
-    pub(super) fn toggle_playback(&mut self) {
+    /// Smart play/pause: if currently playing, pause; if paused but
+    /// the backend has a loaded track, resume; if the backend is
+    /// empty, restart from `self.playing_track`. This lives on
+    /// `TempoApp` because the "restart from index" case needs the
+    /// `tracks` list.
+    pub(super) fn toggle_playback(&mut self, cx: &mut Context<Self>) {
         if self.tracks.is_empty() {
             return;
         }
 
-        if self.is_playing {
-            if let Some(playback) = &self.playback {
-                playback.pause();
-            }
-            self.is_playing = false;
-            self.playback_status = "Playback paused".to_string();
+        let (is_playing, resumable) = {
+            let player = self.player.read(cx);
+            let is_playing = player.is_playing();
+            (is_playing, !is_playing && player.has_playback())
+        };
+
+        if is_playing {
+            self.player.update(cx, |player, cx| player.pause(cx));
             self.context_menu_track = None;
             return;
         }
 
-        if self
-            .playback
-            .as_ref()
-            .is_some_and(|playback| playback.is_empty())
-        {
-            self.play_track(self.playing_track);
+        if resumable {
+            let resumed = self.player.update(cx, |player, cx| player.resume(cx));
+            if !resumed {
+                // Backend was empty; fall through to a fresh
+                // start_playback below.
+                self.play_track(self.playing_track, cx);
+            }
+            self.context_menu_track = None;
             return;
         }
 
-        if let Some(playback) = &self.playback {
-            playback.resume();
-            self.is_playing = true;
-            self.playback_status = "Playing".to_string();
-        }
-
+        // No backend yet (still initializing) — kick off start_playback
+        // anyway so once the backend appears, the click takes effect.
+        self.play_track(self.playing_track, cx);
         self.context_menu_track = None;
     }
 
-    pub(super) fn stop_current_playback(&mut self) {
-        if let Some(playback) = &self.playback {
-            playback.stop();
-        }
-        self.is_playing = false;
-    }
-
-    pub(super) fn select_output_device(&mut self, output_name: String) {
-        self.output_menu_source = None;
-        let was_playing = self.is_playing;
-
-        let result = if let Some(playback) = &mut self.playback {
-            playback.set_output(&output_name, self.volume)
-        } else {
-            match PlaybackController::new(Some(&output_name), self.volume) {
-                Ok(playback) => {
-                    self.playback = Some(playback);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        };
-
-        match result {
-            Ok(()) => {
-                self.output_device = self
-                    .playback
-                    .as_ref()
-                    .map(|playback| playback.output_name().to_string());
-                self.playback_status = if was_playing {
-                    "Playing".to_string()
-                } else {
-                    "Playback paused".to_string()
-                };
-                self.save_app_state();
-
-                if was_playing {
-                    self.play_track_with_history(self.playing_track, false);
-                }
-            }
-            Err(error) => {
-                self.is_playing = false;
-                self.playback_status = format!("Playback unavailable: {error:#}");
-            }
+    pub(super) fn select_output_device(&mut self, output_name: String, cx: &mut Context<Self>) {
+        let was_playing_result = self.player.update(cx, |player, cx| {
+            player.select_output_device(output_name, cx)
+        });
+        if let Ok(true) = was_playing_result {
+            // Audio backend was reset; replay the same track from
+            // scratch so the new device takes over without dropping
+            // the user's place in the queue.
+            self.play_track_with_history(self.playing_track, false, cx);
         }
     }
 
-    pub(super) fn set_playback_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
-
-        if self.volume > 0.0 {
-            self.pre_mute_volume = self.volume;
-        }
-
-        if let Some(playback) = &self.playback {
-            playback.set_volume(self.volume);
-        }
-
-        // Skip the persistence request while the user is mid-drag; the
-        // background save thread already coalesces high-frequency calls,
-        // but skipping the snapshot allocation entirely costs nothing and
-        // shaves the per-frame work to almost zero. `finish_volume_drag`
-        // saves once when the drag ends.
-        if !self.volume_dragging {
-            self.save_app_state();
-        }
+    /// Programmatic volume change — currently unused by UI (the volume
+    /// bar drives the player directly via `begin_volume_drag` /
+    /// `drag_volume`), but exposed for future media-key / DBus
+    /// integration.
+    #[allow(dead_code)]
+    pub(super) fn set_playback_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.player
+            .update(cx, |player, cx| player.set_volume(volume, cx));
     }
 
-    pub(super) fn toggle_mute(&mut self) {
-        if self.volume > 0.0 {
-            self.pre_mute_volume = self.volume;
-            self.set_playback_volume(0.0);
-        } else {
-            self.set_playback_volume(self.pre_mute_volume.max(0.1));
-        }
+    pub(super) fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.player.update(cx, |player, cx| player.toggle_mute(cx));
     }
 
-    pub(super) fn set_max_volume(&mut self) {
-        self.set_playback_volume(1.0);
+    pub(super) fn set_max_volume(&mut self, cx: &mut Context<Self>) {
+        self.player
+            .update(cx, |player, cx| player.set_max_volume(cx));
     }
 
     pub(super) fn begin_volume_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        self.volume_dragging = true;
-        self.set_volume_from_mouse(event.position, cx);
+        let position = self
+            .player
+            .update(cx, |player, cx| player.begin_volume_drag(event, cx));
+        let label = self.player.read(cx).volume_tooltip_label();
+        self.show_tooltip_now("volume-tooltip", label, position, cx);
         cx.stop_propagation();
     }
 
     pub(super) fn drag_volume(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) -> bool {
-        if !self.volume_dragging {
+        let drag_position = self
+            .player
+            .update(cx, |player, cx| player.drag_volume(event, cx));
+        let Some(position) = drag_position else {
             return false;
-        }
-
-        if !event.dragging() {
-            self.finish_volume_drag(cx);
-            return true;
-        }
-
-        self.set_volume_from_mouse(event.position, cx);
+        };
+        let label = self.player.read(cx).volume_tooltip_label();
+        self.show_tooltip_now("volume-tooltip", label, position, cx);
         true
     }
 
     pub(super) fn finish_volume_drag(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.volume_dragging {
-            return false;
+        let was_dragging = self
+            .player
+            .update(cx, |player, cx| player.finish_volume_drag(cx));
+        if was_dragging {
+            self.hide_tooltip_now("volume-tooltip", cx);
         }
-
-        self.volume_dragging = false;
-        self.hide_tooltip_now("volume-tooltip", cx);
-        // Persist the final volume once the drag ends. While dragging,
-        // `set_playback_volume` deliberately skips the save request; this
-        // catches up with one debounced write at drop.
-        self.save_app_state();
-        true
+        was_dragging
     }
 
-    fn set_volume_from_mouse(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let volume = self.volume_from_x(position.x);
-        self.set_playback_volume(volume);
-        self.show_tooltip_now("volume-tooltip", self.volume_tooltip_label(), position, cx);
-    }
-
-    fn volume_from_x(&self, x: Pixels) -> f32 {
-        let bounds = self.volume_bar_scroll_handle.bounds();
-        let width = f32::from(bounds.size.width);
-        if width <= 0.0 {
-            return self.volume;
-        }
-
-        ((f32::from(x) - f32::from(bounds.origin.x)) / width).clamp(0.0, 1.0)
-    }
-
-    fn volume_tooltip_label(&self) -> SharedString {
-        SharedString::from(format!("Volume {}%", (self.volume * 100.0).round() as u8))
-    }
-
-    pub(super) fn play_adjacent_track(&mut self, delta: isize) {
+    pub(super) fn play_adjacent_track(&mut self, delta: isize, cx: &mut Context<Self>) {
         let indices = self.current_track_indices();
         if indices.is_empty() {
             return;
@@ -489,19 +411,28 @@ impl TempoApp {
             .position(|ix| *ix == self.playing_track)
             .unwrap_or(0);
         let next = (position as isize + delta).clamp(0, indices.len().saturating_sub(1) as isize);
-        self.play_track(indices[next as usize]);
+        self.play_track(indices[next as usize], cx);
     }
 
-    pub(super) fn play_finished_track(&mut self) {
-        match self.playback_mode {
-            PlaybackMode::Loop => self.play_track(self.playing_track),
-            PlaybackMode::Shuffle => self.play_random_track(),
+    /// Auto-advance: pick the next track per the active playback
+    /// mode, or stop at end-of-list for `Straight`. Called from the
+    /// `PlayerEvent::TrackFinished` arm of `handle_player_event`.
+    pub(super) fn play_finished_track(&mut self, cx: &mut Context<Self>) {
+        let mode = self.player.read(cx).playback_mode();
+        match mode {
+            PlaybackMode::Loop => self.play_track(self.playing_track, cx),
+            PlaybackMode::Shuffle => self.play_random_track(cx),
             PlaybackMode::Straight => {
                 if let Some(next) = self.next_track_after(self.playing_track) {
-                    self.play_track(next);
+                    self.play_track(next, cx);
                 } else {
-                    self.is_playing = false;
-                    self.playback_status = "Playback finished".to_string();
+                    // End-of-list: surface a status string but keep
+                    // the now-playing strip in place so the user can
+                    // still hit play again.
+                    self.player.update(cx, |player, cx| {
+                        player.stop(cx);
+                        player.playback_status = "Playback finished".to_string();
+                    });
                 }
             }
         }
@@ -513,7 +444,7 @@ impl TempoApp {
         indices.get(position + 1).copied()
     }
 
-    pub(super) fn play_random_track(&mut self) {
+    pub(super) fn play_random_track(&mut self, cx: &mut Context<Self>) {
         let indices = self.current_track_indices();
         if indices.is_empty() {
             return;
@@ -526,359 +457,129 @@ impl TempoApp {
             .filter(|track_ix| indices.len() == 1 || *track_ix != self.playing_track)
             .min_by_key(|track_ix| Self::shuffle_key(&self.tracks[*track_ix], *track_ix, seed))
             .unwrap_or(self.playing_track);
-        self.play_track(next);
+        self.play_track(next, cx);
     }
 
-    pub(super) fn cycle_playback_mode(&mut self) {
-        self.playback_mode = match self.playback_mode {
-            PlaybackMode::Straight => PlaybackMode::Loop,
-            PlaybackMode::Loop => PlaybackMode::Shuffle,
-            PlaybackMode::Shuffle => PlaybackMode::Straight,
-        };
-        self.playback_status = format!("{} mode", self.playback_mode_label());
+    pub(super) fn cycle_playback_mode(&mut self, cx: &mut Context<Self>) {
+        self.player
+            .update(cx, |player, cx| player.cycle_playback_mode(cx));
     }
 
-    pub(super) fn playback_mode_label(&self) -> &'static str {
-        match self.playback_mode {
-            PlaybackMode::Straight => "Straight play",
-            PlaybackMode::Loop => "Loop",
-            PlaybackMode::Shuffle => "Shuffle",
+    /// Seek within the currently-playing track. If the audio backend
+    /// is empty (e.g. after a stop), restarts playback from the
+    /// current track first. Lives on `TempoApp` because the restart
+    /// case needs the track index → path resolution.
+    ///
+    /// Currently exposed for media-key / scrubber integrations; the
+    /// in-app waveform click goes through `seek_from_waveform_click`.
+    #[allow(dead_code)]
+    pub(super) fn seek_playback(&mut self, position: Duration, cx: &mut Context<Self>) {
+        let needs_restart = self.player.update(cx, |player, cx| {
+            // Check before calling seek so we don't burn the seek
+            // request on an empty backend.
+            if !player.has_playback() {
+                player.playback_status = "Playback unavailable".to_string();
+                return false;
+            }
+            !player.seek(position, cx)
+        });
+        if needs_restart {
+            self.play_track_with_history(self.playing_track, false, cx);
+            // After restart, retry the seek so the click feels
+            // immediate.
+            self.player
+                .update(cx, |player, cx| _ = player.seek(position, cx));
         }
     }
 
-    pub(super) fn playback_position(&self) -> Duration {
-        self.playback
-            .as_ref()
-            .filter(|playback| !playback.is_empty())
-            .map(PlaybackController::position)
-            .unwrap_or_default()
-    }
-
-    pub(super) fn seek_from_waveform_click(&mut self, click_x: f32, viewport_width: f32) {
+    pub(super) fn seek_from_waveform_click(
+        &mut self,
+        click_x: f32,
+        viewport_width: f32,
+        cx: &mut Context<Self>,
+    ) {
         let Some(track) = self.tracks.get(self.playing_track) else {
             return;
         };
-
-        let waveform_left = PLAYER_BAR_PAD + PLAYER_ART_W + PLAYER_GAP + PLAYER_INFO_W + PLAYER_GAP;
-        let waveform_right = viewport_width - (PLAYER_GAP + PLAYER_CONTROLS_W + PLAYER_BAR_PAD);
-        let waveform_width = (waveform_right - waveform_left).max(1.0);
-        let ratio = ((click_x - waveform_left) / waveform_width).clamp(0.0, 1.0);
-        let target = track.duration_value.mul_f32(ratio);
-
-        self.seek_playback(target);
-    }
-
-    pub(super) fn seek_playback(&mut self, position: Duration) {
-        if self
-            .playback
-            .as_ref()
-            .is_some_and(|playback| playback.is_empty())
-        {
-            self.play_track(self.playing_track);
-        }
-
-        match &self.playback {
-            Some(playback) => match playback.seek(position) {
-                Ok(()) => {
-                    self.playback_status = format!("Seeked to {}", format_duration(position));
-                }
-                Err(error) => {
-                    self.playback_status = format!("Seek failed: {error:#}");
-                }
-            },
-            None => {
-                self.playback_status = "Playback unavailable".to_string();
-            }
+        let duration = track.duration_value;
+        let outcome = self.player.update(cx, |player, cx| {
+            player.seek_from_waveform_click(click_x, viewport_width, duration, cx)
+        });
+        if outcome.needs_restart {
+            // Backend was empty (e.g. seek after natural end-of-track
+            // stop). Restart playback for the current track and
+            // re-issue the seek so the click feels immediate.
+            self.play_track_with_history(self.playing_track, false, cx);
+            self.player
+                .update(cx, |player, cx| _ = player.seek(outcome.target, cx));
         }
     }
+}
 
-    pub(super) fn cached_waveform(
-        &mut self,
-        track_ix: usize,
-        cx: &mut Context<Self>,
-    ) -> (Arc<[f32]>, bool) {
-        let start = Instant::now();
-        if self.waveform_cache.len() < self.tracks.len() {
-            self.waveform_cache.resize_with(self.tracks.len(), || None);
-        }
-        if self.waveform_loading.len() < self.tracks.len() {
-            self.waveform_loading.resize(self.tracks.len(), false);
-        }
+// ============================================================================
+// Marquee helper — stateless, free function. Rendered by the player
+// bar but kept here (rather than in a separate module) to share the
+// gap/duration constants with the bar layout.
+// ============================================================================
 
-        if let Some(waveform) = self.waveform_cache[track_ix].as_ref() {
-            perf::log_duration_if_slow(
-                "player.cached_waveform.hit",
-                start.elapsed(),
-                Duration::from_millis(2),
-                format!("track_ix={track_ix} segments={}", waveform.len()),
-            );
-            // Refcount bump only -- the caller does not need to mutate
-            // the buffer.
-            return (Arc::clone(waveform), self.waveform_loading[track_ix]);
-        }
+impl TempoApp {
+    fn render_marquee_text(
+        text: SharedString,
+        animation_id: impl Into<SharedString>,
+        available_width: f32,
+        average_char_width: f32,
+        color: u32,
+    ) -> AnyElement {
+        let text_width = (text.chars().count() as f32 * average_char_width).max(1.0);
 
-        let source = WaveformSource::from_track(&self.tracks[track_ix]);
-
-        if !self.waveform_loading[track_ix] {
-            self.waveform_loading[track_ix] = true;
-            let expected_path = source.path.clone();
-            let catalog = self.catalog.clone();
-            perf::event(
-                "player.waveform.request",
-                format!("track_ix={track_ix} path={}", expected_path.display()),
-            );
-            cx.spawn(async move |this, cx| {
-                let waveform: Arc<[f32]> = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let peaks = TempoApp::load_or_generate_waveform(&source, catalog);
-                        Arc::<[f32]>::from(peaks)
-                    })
-                    .await;
-
-                let _ = this.update(cx, |app, cx| {
-                    if app
-                        .tracks
-                        .get(track_ix)
-                        .is_some_and(|track| track.path == expected_path)
-                    {
-                        if track_ix < app.waveform_cache.len() {
-                            app.waveform_cache[track_ix] = Some(waveform);
-                        }
-                        if track_ix < app.waveform_loading.len() {
-                            app.waveform_loading[track_ix] = false;
-                        }
-                        cx.notify();
-                    }
-                });
-            })
-            .detach();
+        if text_width <= available_width {
+            return div()
+                .w_full()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_color(rgb(color))
+                .child(text)
+                .into_any_element();
         }
 
-        (
-            Arc::<[f32]>::from(Self::generate_loading_waveform(
-                Self::waveform_loading_phase(),
-            )),
-            true,
-        )
+        let gap = 44.0;
+        let scroll_distance = text_width + gap;
+        let duration = Duration::from_millis(((scroll_distance / 18.0).max(7.0) * 1000.0) as u64);
+
+        div()
+            .w_full()
+            .overflow_hidden()
+            .text_color(rgb(color))
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .child(div().w(px(text_width)).flex_none().child(text.clone()))
+                    .child(div().w(px(gap)).flex_none())
+                    .child(div().w(px(text_width)).flex_none().child(text))
+                    .with_animation(
+                        animation_id.into(),
+                        Animation::new(duration).repeat(),
+                        move |this, delta| this.ml(px(-scroll_distance * delta)),
+                    ),
+            )
+            .into_any_element()
     }
+}
 
-    pub(super) fn load_or_generate_waveform(
-        track: &WaveformSource,
-        catalog: Option<CatalogStore>,
-    ) -> Vec<f32> {
-        let start = Instant::now();
-        if let Some(catalog) = catalog.as_ref()
-            && let Ok(Some(waveform)) =
-                catalog.load_waveform(&track.path, WAVEFORM_SEGMENTS, WAVEFORM_CACHE_VERSION)
-        {
-            perf::log_duration(
-                "player.waveform.load_or_generate",
-                start.elapsed(),
-                format!("source=cache path={}", track.path.display()),
-            );
-            return waveform;
-        }
+// ============================================================================
+// Player bar rendering — reads current state from `self.player`,
+// dispatches mutations back through `self.player.update(cx, ...)`.
+//
+// Kept on `TempoApp` (not `PlayerEntity::render`) because it needs
+// the active track's metadata from `self.tracks` to paint the
+// marquees and album tile. A future refactor that pushes the active
+// `Track` clone onto the player after `play_track` could move this
+// wholesale; the rendering API is otherwise self-contained.
+// ============================================================================
 
-        let Some(waveform) = Self::decode_waveform(track) else {
-            let waveform = Self::generate_fallback_waveform(track);
-            perf::log_duration(
-                "player.waveform.load_or_generate",
-                start.elapsed(),
-                format!("source=fallback path={}", track.path.display()),
-            );
-            return waveform;
-        };
-
-        if let Some(catalog) = catalog.as_ref() {
-            let _ = catalog.save_waveform(
-                &track.path,
-                WAVEFORM_SEGMENTS,
-                WAVEFORM_CACHE_VERSION,
-                &waveform,
-            );
-        }
-
-        perf::log_duration(
-            "player.waveform.load_or_generate",
-            start.elapsed(),
-            format!("source=decode path={}", track.path.display()),
-        );
-        waveform
-    }
-
-    pub(super) fn decode_waveform(track: &WaveformSource) -> Option<Vec<f32>> {
-        let start = Instant::now();
-        let waveform =
-            Self::decode_waveform_sampled(track).or_else(|| Self::decode_waveform_full(track));
-        perf::log_duration(
-            "player.waveform.decode",
-            start.elapsed(),
-            format!(
-                "path={} success={}",
-                track.path.display(),
-                waveform.is_some()
-            ),
-        );
-        waveform
-    }
-
-    pub(super) fn decode_waveform_sampled(track: &WaveformSource) -> Option<Vec<f32>> {
-        let file = fs::File::open(&track.path).ok()?;
-        let file_size = file.metadata().ok()?.len();
-        let mut builder = Decoder::builder()
-            .with_data(file)
-            .with_byte_len(file_size)
-            .with_seekable(true)
-            .with_coarse_seek(true)
-            .with_gapless(false);
-
-        if let Some(extension) = track
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-        {
-            builder = builder.with_hint(extension);
-        }
-
-        let mut decoder = builder.build().ok()?;
-        let duration = decoder.total_duration().unwrap_or(track.duration_value);
-
-        if duration < WAVEFORM_SAMPLED_MIN_DURATION {
-            return None;
-        }
-
-        let sample_rate = decoder.sample_rate().get() as usize;
-        let channels = decoder.channels().get() as usize;
-        let total_samples = (duration.as_secs_f64() * sample_rate as f64 * channels as f64)
-            .ceil()
-            .max(1.0) as usize;
-        let samples_per_bin = (total_samples / WAVEFORM_SEGMENTS).max(1);
-        let sample_window = (samples_per_bin / 10).clamp(
-            WAVEFORM_MIN_SAMPLE_FRAMES * channels,
-            WAVEFORM_MAX_SAMPLE_FRAMES * channels,
-        );
-        let segment_seconds = duration.as_secs_f64() / WAVEFORM_SEGMENTS as f64;
-
-        if !segment_seconds.is_finite() || segment_seconds <= 0.0 {
-            return None;
-        }
-
-        let mut peaks = vec![0.0_f32; WAVEFORM_SEGMENTS];
-        let mut saw_sample = false;
-
-        for (segment, peak) in peaks.iter_mut().enumerate() {
-            if segment > 0 {
-                let target = Duration::from_secs_f64(segment_seconds * segment as f64);
-                decoder.try_seek(target).ok()?;
-            }
-
-            for _ in 0..sample_window {
-                let Some(sample) = decoder.next() else {
-                    break;
-                };
-
-                *peak = peak.max(sample.abs());
-                saw_sample = true;
-            }
-        }
-
-        saw_sample.then(|| Self::normalize_waveform_peaks(peaks))
-    }
-
-    pub(super) fn decode_waveform_full(track: &WaveformSource) -> Option<Vec<f32>> {
-        let file = fs::File::open(&track.path).ok()?;
-        let mut decoder = Decoder::try_from(file).ok()?;
-        let duration = decoder.total_duration().unwrap_or(track.duration_value);
-        let sample_rate = decoder.sample_rate().get() as f64;
-        let channels = decoder.channels().get() as f64;
-        let total_samples = (duration.as_secs_f64() * sample_rate * channels)
-            .ceil()
-            .max(1.0) as usize;
-
-        if total_samples == 0 {
-            return None;
-        }
-
-        let mut peaks = vec![0.0_f32; WAVEFORM_SEGMENTS];
-        let mut saw_sample = false;
-        let samples_per_bin = (total_samples / WAVEFORM_SEGMENTS).max(1);
-        let mut bin = 0;
-        let mut next_bin_sample = samples_per_bin;
-
-        for (sample_ix, sample) in decoder.by_ref().enumerate() {
-            while sample_ix >= next_bin_sample && bin < WAVEFORM_SEGMENTS - 1 {
-                bin += 1;
-                next_bin_sample = next_bin_sample.saturating_add(samples_per_bin);
-            }
-
-            peaks[bin] = peaks[bin].max(sample.abs());
-            saw_sample = true;
-        }
-
-        if !saw_sample {
-            return None;
-        }
-
-        Some(Self::normalize_waveform_peaks(peaks))
-    }
-
-    pub(super) fn normalize_waveform_peaks(peaks: Vec<f32>) -> Vec<f32> {
-        let max_peak = peaks.iter().copied().fold(0.0_f32, f32::max).max(0.001);
-        peaks
-            .into_iter()
-            .map(|peak| 8.0 + (peak / max_peak).sqrt() * 50.0)
-            .collect()
-    }
-
-    pub(super) fn generate_fallback_waveform(track: &WaveformSource) -> Vec<f32> {
-        let mut seed = 0xcbf29ce484222325_u64;
-
-        for part in [&track.title, &track.artist, &track.album, &track.duration] {
-            for byte in part.bytes() {
-                seed ^= byte as u64;
-                seed = seed.wrapping_mul(0x100000001b3);
-            }
-        }
-
-        let pulse_count = 3.0 + (track.title.len() % 5) as f32;
-        let mut previous = 0.38;
-
-        (0..WAVEFORM_SEGMENTS)
-            .map(|ix| {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-
-                let noise = ((seed >> 33) as f32) / ((1_u64 << 31) as f32);
-                let position = ix as f32 / WAVEFORM_SEGMENTS as f32;
-                let pulse = (position * std::f32::consts::TAU * pulse_count).sin().abs();
-                let target = (0.16 + noise * 0.5 + pulse * 0.34).min(1.0);
-
-                previous = previous * 0.66 + target * 0.34;
-                8.0 + previous * 50.0
-            })
-            .collect()
-    }
-
-    pub(super) fn generate_loading_waveform(phase: f32) -> Vec<f32> {
-        (0..WAVEFORM_SEGMENTS)
-            .map(|ix| {
-                let position = ix as f32 / 12.0;
-                let sweep = ((position - phase).sin() + 1.0) * 0.5;
-                let ripple = ((position * 0.35 + phase * 0.6).sin() + 1.0) * 0.5;
-                (10.0 + (sweep * 0.7 + ripple * 0.3) * 42.0).round()
-            })
-            .collect()
-    }
-
-    pub(super) fn waveform_loading_phase() -> f32 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as f32 / 90.0)
-            .unwrap_or_default()
-    }
-
+impl TempoApp {
     pub(super) fn render_player_bar(
         &mut self,
         window: &mut Window,
@@ -936,13 +637,45 @@ impl TempoApp {
         }
 
         self.playing_track = self.playing_track.min(self.tracks.len() - 1);
-        let (waveform, waveform_loading) = self.cached_waveform(self.playing_track, cx);
+        let playing_track_ix = self.playing_track;
+        let source = WaveformSource::from_track(&self.tracks[playing_track_ix]);
+        let (waveform, waveform_loading) = self
+            .player
+            .update(cx, |player, cx| player.cached_waveform(&source, cx));
         if waveform_loading {
             window.request_animation_frame();
         }
-        let playback_position = self.playback_position();
-        let playing_track_ix = self.playing_track;
-        let track = &self.tracks[self.playing_track];
+        // Snapshot all the player fields the render path consumes in
+        // one pass, releasing the borrow before we touch
+        // `self.tracks` / `self.colors()` / `self.album_tile_*` below.
+        // `alt_pressed` lives on the entity for future use (e.g.
+        // headless rendering), but the render path queries
+        // `window.modifiers().alt` directly because that's the
+        // authoritative source at paint time and accounts for
+        // modifier presses since the last `on_modifiers_changed`
+        // event.
+        let (
+            is_playing,
+            playback_position,
+            now_playing_info_hovered,
+            hovered_link,
+            playback_status_label,
+            volume,
+            output_menu_open_in_player,
+        ) = {
+            let player_state = self.player.read(cx);
+            (
+                player_state.is_playing(),
+                player_state.playback_position(),
+                player_state.now_playing_info_hovered(),
+                player_state.hovered_now_playing_link(),
+                player_state.playback_status_label(),
+                player_state.volume(),
+                player_state.output_menu_source() == Some(OutputMenuSource::Player),
+            )
+        };
+
+        let track = &self.tracks[playing_track_ix];
         let playback_position = playback_position.min(track.duration_value);
         let playback_progress = if track.duration_value.is_zero() {
             0.0
@@ -950,30 +683,29 @@ impl TempoApp {
             (playback_position.as_secs_f32() / track.duration_value.as_secs_f32()).clamp(0.0, 1.0)
         };
         let now_playing_active_color = colors.accent;
-        let show_alternate_now_playing_info =
-            self.now_playing_info_hovered && window.modifiers().alt;
+        let show_alternate_now_playing_info = now_playing_info_hovered && window.modifiers().alt;
         let year_label = if track.year.eq_ignore_ascii_case("unknown year") {
             "Unknown Year".to_string()
         } else {
             track.year.to_string()
         };
-        let alternate_status = format!("{} | {}", year_label, self.playback_status_label());
-        let title_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Title) {
+        let alternate_status = format!("{} | {}", year_label, playback_status_label);
+        let title_color = if hovered_link == Some(NowPlayingLink::Title) {
             now_playing_active_color
         } else {
             colors.text_strong
         };
-        let artist_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Artist) {
+        let artist_color = if hovered_link == Some(NowPlayingLink::Artist) {
             now_playing_active_color
         } else {
             colors.text_muted
         };
-        let album_color = if self.hovered_now_playing_link == Some(NowPlayingLink::Album) {
+        let album_color = if hovered_link == Some(NowPlayingLink::Album) {
             now_playing_active_color
         } else {
             colors.text_faint
         };
-        let volume_fill = PLAYER_VOLUME_BAR_W * self.volume;
+        let volume_fill = PLAYER_VOLUME_BAR_W * volume;
 
         div()
             .id("player-bar")
@@ -988,8 +720,10 @@ impl TempoApp {
             .border_color(rgb(colors.button_hover))
             .bg(rgb(colors.player))
             .on_modifiers_changed(cx.listener(|this, event: &ModifiersChangedEvent, _, cx| {
-                this.alt_pressed = event.modifiers.alt;
-                if this.now_playing_info_hovered {
+                let needs_repaint = this
+                    .player
+                    .update(cx, |player, _| player.set_alt_pressed(event.modifiers.alt));
+                if needs_repaint {
                     cx.notify();
                 }
             }))
@@ -1018,8 +752,10 @@ impl TempoApp {
                     .justify_center()
                     .gap(px(2.0))
                     .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                        this.now_playing_info_hovered = *hovered;
-                        this.alt_pressed = window.modifiers().alt;
+                        let alt = window.modifiers().alt;
+                        this.player.update(cx, |player, _| {
+                            player.set_now_playing_info_hovered(*hovered, alt);
+                        });
                         cx.notify();
                     }))
                     .child(if show_alternate_now_playing_info {
@@ -1095,14 +831,17 @@ impl TempoApp {
                                     .text_color(rgb(title_color))
                                     .cursor_pointer()
                                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        if *hovered {
-                                            this.hovered_now_playing_link =
-                                                Some(NowPlayingLink::Title);
-                                        } else if this.hovered_now_playing_link
-                                            == Some(NowPlayingLink::Title)
-                                        {
-                                            this.hovered_now_playing_link = None;
-                                        }
+                                        this.player.update(cx, |player, _| {
+                                            if *hovered {
+                                                player.set_hovered_now_playing_link(Some(
+                                                    NowPlayingLink::Title,
+                                                ));
+                                            } else if player.hovered_now_playing_link()
+                                                == Some(NowPlayingLink::Title)
+                                            {
+                                                player.set_hovered_now_playing_link(None);
+                                            }
+                                        });
                                         cx.notify();
                                     }))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1128,14 +867,17 @@ impl TempoApp {
                                     .text_color(rgb(artist_color))
                                     .cursor_pointer()
                                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        if *hovered {
-                                            this.hovered_now_playing_link =
-                                                Some(NowPlayingLink::Artist);
-                                        } else if this.hovered_now_playing_link
-                                            == Some(NowPlayingLink::Artist)
-                                        {
-                                            this.hovered_now_playing_link = None;
-                                        }
+                                        this.player.update(cx, |player, _| {
+                                            if *hovered {
+                                                player.set_hovered_now_playing_link(Some(
+                                                    NowPlayingLink::Artist,
+                                                ));
+                                            } else if player.hovered_now_playing_link()
+                                                == Some(NowPlayingLink::Artist)
+                                            {
+                                                player.set_hovered_now_playing_link(None);
+                                            }
+                                        });
                                         cx.notify();
                                     }))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1161,14 +903,17 @@ impl TempoApp {
                                     .text_color(rgb(album_color))
                                     .cursor_pointer()
                                     .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                        if *hovered {
-                                            this.hovered_now_playing_link =
-                                                Some(NowPlayingLink::Album);
-                                        } else if this.hovered_now_playing_link
-                                            == Some(NowPlayingLink::Album)
-                                        {
-                                            this.hovered_now_playing_link = None;
-                                        }
+                                        this.player.update(cx, |player, _| {
+                                            if *hovered {
+                                                player.set_hovered_now_playing_link(Some(
+                                                    NowPlayingLink::Album,
+                                                ));
+                                            } else if player.hovered_now_playing_link()
+                                                == Some(NowPlayingLink::Album)
+                                            {
+                                                player.set_hovered_now_playing_link(None);
+                                            }
+                                        });
                                         cx.notify();
                                     }))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -1208,7 +953,7 @@ impl TempoApp {
                     .flex_col()
                     .gap_2()
                     .text_color(rgb(colors.text_muted))
-                    .child(self.transport_overlay(self.is_playing, cx))
+                    .child(self.transport_overlay(is_playing, cx))
                     .child(
                         div()
                             .flex()
@@ -1220,12 +965,14 @@ impl TempoApp {
                                     .cursor_pointer()
                                     .active(|this| this.opacity(0.75))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.toggle_mute();
+                                        this.toggle_mute(cx);
                                         cx.notify();
                                     }))
                                     .child(Self::volume_speaker_icon(1, colors)),
                             )
-                            .child(
+                            .child({
+                                let volume_handle =
+                                    self.player.read(cx).volume_bar_scroll_handle.clone();
                                 div()
                                     .id("volume-bar")
                                     .w(px(PLAYER_VOLUME_BAR_W))
@@ -1234,7 +981,7 @@ impl TempoApp {
                                     .flex()
                                     .items_center()
                                     .cursor_pointer()
-                                    .track_scroll(&self.volume_bar_scroll_handle)
+                                    .track_scroll(&volume_handle)
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(|this, event: &MouseDownEvent, _window, cx| {
@@ -1254,30 +1001,29 @@ impl TempoApp {
                                                     .rounded_full()
                                                     .bg(rgb(colors.text)),
                                             ),
-                                    ),
-                            )
+                                    )
+                            })
                             .child(
                                 div()
                                     .id("volume-max")
                                     .cursor_pointer()
                                     .active(|this| this.opacity(0.75))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_max_volume();
+                                        this.set_max_volume(cx);
                                         cx.notify();
                                     }))
                                     .child(Self::volume_speaker_icon(3, colors)),
                             ),
                     ),
             )
-            .when(
-                self.output_menu_source == Some(OutputMenuSource::Player),
-                |this| this.child(self.player_output_device_menu(cx)),
-            )
+            .when(output_menu_open_in_player, |this| {
+                this.child(self.player_output_device_menu(cx))
+            })
             .into_any_element()
     }
 
-    pub(super) fn playback_mode_icon(&self) -> &'static str {
-        match self.playback_mode {
+    pub(super) fn playback_mode_icon(&self, cx: &gpui::App) -> &'static str {
+        match self.player.read(cx).playback_mode() {
             PlaybackMode::Straight => "→",
             PlaybackMode::Loop => "↻",
             PlaybackMode::Shuffle => "⤨",
@@ -1319,33 +1065,18 @@ impl TempoApp {
         .into_any_element()
     }
 
-    pub(super) fn playback_status_label(&self) -> &'static str {
-        if self.playback.is_none() {
-            "Unavailable"
-        } else if self.is_playing {
-            "Playing"
-        } else {
-            "Paused"
-        }
-    }
-
-    pub(super) fn current_output_label(&self) -> String {
-        self.playback
-            .as_ref()
-            .map(|playback| playback.output_name().to_string())
-            .or_else(|| self.output_device.clone())
-            .unwrap_or_else(|| "No output device".to_string())
-    }
-
     pub(super) fn playback_status_dropdown(
         &self,
         source: OutputMenuSource,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let button_label = match source {
-            OutputMenuSource::Player => format!("{} ▾", self.playback_status_label()),
-            OutputMenuSource::Settings => format!("{} ▾", self.current_output_label()),
+        let button_label = {
+            let player = self.player.read(cx);
+            match source {
+                OutputMenuSource::Player => format!("{} ▾", player.playback_status_label()),
+                OutputMenuSource::Settings => format!("{} ▾", player.current_output_label()),
+            }
         };
 
         div()
@@ -1366,13 +1097,10 @@ impl TempoApp {
                     .text_color(rgb(colors.text_muted))
                     .hover(move |this| this.text_color(rgb(colors.accent)).bg(rgb(colors.hover)))
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.output_menu_position = event.position();
-                        this.output_menu_source = if this.output_menu_source == Some(source) {
-                            None
-                        } else {
-                            Some(source)
-                        };
-                        cx.notify();
+                        let position = event.position();
+                        this.player.update(cx, |player, cx| {
+                            player.toggle_output_menu(source, position, cx);
+                        });
                     }))
                     .child(button_label),
             )
@@ -1382,8 +1110,9 @@ impl TempoApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let position = self.player.read(cx).output_menu_position();
         self.menu_at(
-            self.output_menu_position,
+            position,
             Corner::BottomLeft,
             point(px(0.0), px(-8.0)),
             self.output_device_menu(OutputMenuSource::Player, cx),
@@ -1394,8 +1123,9 @@ impl TempoApp {
         &self,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
+        let position = self.player.read(cx).output_menu_position();
         self.menu_at(
-            self.output_menu_position,
+            position,
             Corner::TopRight,
             point(px(24.0), px(18.0)),
             self.output_device_menu(OutputMenuSource::Settings, cx),
@@ -1408,7 +1138,7 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
-        let current_output = self.current_output_label();
+        let current_output = self.player.read(cx).current_output_label();
         let devices = perf::time(
             "player.output_devices_for_menu",
             "",
@@ -1454,7 +1184,7 @@ impl TempoApp {
                                 .text_color(rgb(colors.text_strong))
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_output_device(output_name.clone());
+                            this.select_output_device(output_name.clone(), cx);
                             cx.notify();
                         }))
                         .child(
@@ -1505,7 +1235,7 @@ impl TempoApp {
                 if event.standard_click() {
                     let click_x = f32::from(event.position().x);
                     let viewport_width = f32::from(window.viewport_size().width);
-                    this.seek_from_waveform_click(click_x, viewport_width);
+                    this.seek_from_waveform_click(click_x, viewport_width, cx);
                     cx.notify();
                 }
             }))
@@ -1529,7 +1259,7 @@ impl TempoApp {
                     .flex()
                     .items_center()
                     .gap(px(1.0))
-                    // `Arc<[f32]>::iter()` borrows the slice -- no clone
+                    // `Arc<[f32]>::iter()` borrows the slice — no clone
                     // of the underlying buffer per frame, unlike the
                     // prior `Vec<f32>` which was cloned per render.
                     .children(
@@ -1628,6 +1358,8 @@ impl TempoApp {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let colors = *self.colors();
+        let mode_icon = self.playback_mode_icon(cx);
+        let mode_active = self.player.read(cx).playback_mode() != PlaybackMode::Straight;
 
         div()
             .relative()
@@ -1642,41 +1374,37 @@ impl TempoApp {
             .border_1()
             .border_color(rgb(colors.waveform_border))
             .child(
-                self.transport_button(
-                    self.playback_mode_icon(),
-                    false,
-                    self.playback_mode != PlaybackMode::Straight,
-                )
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.cycle_playback_mode();
-                    cx.notify();
-                })),
+                self.transport_button(mode_icon, false, mode_active)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cycle_playback_mode(cx);
+                        cx.notify();
+                    })),
             )
             .child(
                 self.transport_button("◀", false, false)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_adjacent_track(-1);
+                        this.play_adjacent_track(-1, cx);
                         cx.notify();
                     })),
             )
             .child(
                 self.transport_button(if is_playing { "Ⅱ" } else { "▶" }, true, false)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.toggle_playback();
+                        this.toggle_playback(cx);
                         cx.notify();
                     })),
             )
             .child(
                 self.transport_button("▶", false, false)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_adjacent_track(1);
+                        this.play_adjacent_track(1, cx);
                         cx.notify();
                     })),
             )
             .child(
                 self.transport_button("↻", false, false)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.play_random_track();
+                        this.play_random_track(cx);
                         cx.notify();
                     })),
             )

@@ -264,6 +264,7 @@ impl TempoApp {
             .iter()
             .position(|track| track.path == entry.track_path);
         let active = track_ix.is_some_and(|track_ix| track_ix == self.playing_track);
+        let is_playing = self.player.read(cx).is_playing();
         let bg = if active {
             colors.playing
         } else if ix.is_multiple_of(2) {
@@ -295,7 +296,7 @@ impl TempoApp {
                     this.column_menu_open = false;
 
                     if event.standard_click() && event.click_count() >= 2 {
-                        this.play_track(track_ix);
+                        this.play_track(track_ix, cx);
                     }
 
                     cx.notify();
@@ -305,12 +306,9 @@ impl TempoApp {
                 self.history_played_at_cell(history_ix, entry.played_at_unix_secs, cx)
                     .into_any_element(),
             )
-            .children(
-                self.visible_columns
-                    .iter()
-                    .copied()
-                    .map(|column| self.history_column_cell(column, track_ix, entry, active)),
-            )
+            .children(self.visible_columns.iter().copied().map(|column| {
+                self.history_column_cell(column, track_ix, entry, active, is_playing)
+            }))
     }
 
     fn history_played_at_cell(
@@ -345,11 +343,12 @@ impl TempoApp {
         track_ix: Option<usize>,
         entry: &PlaybackHistoryEntry,
         active: bool,
+        is_playing: bool,
     ) -> AnyElement {
         if let Some((track_ix, track)) =
             track_ix.and_then(|track_ix| self.tracks.get(track_ix).map(|track| (track_ix, track)))
         {
-            return self.track_cell(column, track_ix, track, active, false);
+            return self.track_cell(column, track_ix, track, active, is_playing, false);
         }
 
         self.history_snapshot_cell(column, entry, active)

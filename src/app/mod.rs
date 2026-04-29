@@ -10,11 +10,11 @@ use std::{
 
 use gpui::{
     Animation, AnimationExt as _, AnyElement, ClickEvent, ClipboardItem, Context, Corner,
-    CursorStyle, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ObjectFit,
-    ParentElement, PathPromptOptions, Pixels, Point, Render, ScrollStrategy, ScrollWheelEvent,
-    SharedString, Styled, Subscription, UniformListScrollHandle, Window, anchored, div, img, point,
-    prelude::*, px, rgb, uniform_list,
+    CursorStyle, Entity, FocusHandle, Image, ImageFormat, IntoElement, KeyDownEvent,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    ScrollStrategy, ScrollWheelEvent, SharedString, Styled, Subscription, UniformListScrollHandle,
+    Window, anchored, div, img, point, prelude::*, px, rgb, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};
@@ -114,7 +114,7 @@ enum SortDirection {
     Descending,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PlaybackMode {
     Straight,
     Loop,
@@ -136,13 +136,13 @@ impl OnlineMetadataMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum OutputMenuSource {
     Player,
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NowPlayingLink {
     Title,
     Artist,
@@ -951,14 +951,17 @@ pub(crate) struct TempoApp {
     back_history: Vec<NavigationEntry>,
     forward_history: Vec<NavigationEntry>,
     hovered_tooltip_id: Option<SharedString>,
-    now_playing_info_hovered: bool,
-    hovered_now_playing_link: Option<NowPlayingLink>,
-    alt_pressed: bool,
     tooltip: Option<Tooltip>,
     tooltip_generation: u64,
+    /// Cached resolution of `self.player.read(cx).playing_track_path()`
+    /// against `self.track_path_index`. Refreshed when the player
+    /// emits [`player::PlayerEvent::PlayingTrackChanged`] and when the
+    /// track list mutates (scan apply, library reload). Cross-region
+    /// readers (table active-row, history page) check both this *and*
+    /// `self.player.read(cx).is_playing()` to decide whether to draw
+    /// the playing-row highlight. Stays at the last valid value when
+    /// nothing is playing so seek-and-resume still works.
     playing_track: usize,
-    is_playing: bool,
-    playback_mode: PlaybackMode,
     context_menu_track: Option<usize>,
     context_menu_position: Point<Pixels>,
     /// Right-click context menu state for sidebar playlist nav items.
@@ -1008,12 +1011,6 @@ pub(crate) struct TempoApp {
     artist_view_mode: BrowseViewMode,
     album_view_mode: BrowseViewMode,
     queue: Vec<usize>,
-    /// Per-track waveform cache. `Arc<[f32]>` so the per-frame
-    /// `cached_waveform` lookup hands out a refcount-bumped slice
-    /// instead of cloning the underlying ~360-float buffer on every
-    /// repaint while a track plays.
-    waveform_cache: Vec<Option<Arc<[f32]>>>,
-    waveform_loading: Vec<bool>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
     playback_history: Vec<PlaybackHistoryEntry>,
@@ -1021,15 +1018,7 @@ pub(crate) struct TempoApp {
     themes: Vec<Theme>,
     library_root_label: String,
     library_status: String,
-    playback_status: String,
-    output_device: Option<String>,
-    output_menu_source: Option<OutputMenuSource>,
-    output_menu_position: Point<Pixels>,
     online_metadata_mode: OnlineMetadataMode,
-    volume: f32,
-    pre_mute_volume: f32,
-    volume_dragging: bool,
-    volume_bar_scroll_handle: gpui::ScrollHandle,
     scan_progress: ScanProgress,
     scan_errors: Vec<IndexingError>,
     scan_changed_tracks: bool,
@@ -1053,7 +1042,50 @@ pub(crate) struct TempoApp {
     metadata_demand_queue: Arc<Mutex<MetadataDemandQueue>>,
     metadata_status_expanded: bool,
     _metadata_worker: Option<MetadataWorker>,
-    playback: Option<PlaybackController>,
+    /// the architectural design notes — in short, this entity owns the
+    /// audio backend, current track identity, volume, output device
+    /// picker, waveform cache, and now-playing hover state, so the
+    /// per-second playback tick only invalidates the player bar
+    /// instead of the whole app tree.
+    ///
+    /// `TempoApp` retains the `tracks`/`tabs`/`queue`/`playback_history`
+    /// state and orchestrates "play this track" by resolving an index
+    /// to a path and calling `player.update(cx, |p, cx|
+    /// p.start_playback(...))`.
+    /// The audio playback subsystem. See [`player::PlayerEntity`] for
+    /// the architectural design notes — in short, this entity owns the
+    /// audio backend, current track identity, volume, output device
+    /// picker, waveform cache, and now-playing hover state, so the
+    /// per-second playback tick only invalidates the player bar
+    /// instead of the whole app tree.
+    ///
+    /// `TempoApp` retains the `tracks`/`tabs`/`queue`/`playback_history`
+    /// state and orchestrates "play this track" by resolving an index
+    /// to a path and calling `player.update(cx, |p, cx|
+    /// p.start_playback(...))`.
+    player: Entity<player::PlayerEntity>,
+    /// Denormalized mirror of `self.player.read(cx).volume()` — kept
+    /// in sync via the [`player::PlayerEvent::StateMutated`] handler.
+    /// Exists so [`Self::build_app_state_snapshot`] can read from
+    /// `&self` only, sparing the dozens of `save_app_state()` callsites
+    /// across settings / playlist / tab code from having to take
+    /// `cx`. Authoritative state is on `self.player`; this field is
+    /// for serialization only.
+    volume_snapshot: f32,
+    /// Denormalized mirror of `self.player.read(cx).output_device()`,
+    /// for the same reason as `volume_snapshot`.
+    output_device_snapshot: Option<String>,
+    /// Held subscription that forwards [`player::PlayerEvent`]s into
+    /// `TempoApp::handle_player_event`. Dropping this subscription
+    /// would silently break cross-region updates (e.g. table active
+    /// row would stop refreshing on track change), so it lives on the
+    /// app for the app's lifetime.
+    _player_subscription: Subscription,
+    /// Held observation that forwards untyped `cx.notify()` calls on
+    /// the player to a parent rerender. Required while the player
+    /// bar is rendered as part of `TempoApp::render` rather than as
+    /// a child entity — see the construction-site comment in `new`.
+    _player_observation: Subscription,
     _save_on_quit: Option<Subscription>,
 }
 
@@ -1108,13 +1140,37 @@ impl TempoApp {
         let playlists = state.playlists;
         let volume = state.volume.clamp(0.0, 1.0);
         let visible_columns = Self::sanitize_visible_columns(state.visible_table_columns);
-        // Playback init is deferred to a background task so it does not block
-        // the first frame; until it completes, `playback` is `None` (UI already
-        // tolerates this) and clicks that need playback fall through silently
-        // for the brief moment before init completes.
-        let playback: Option<PlaybackController> = None;
-        let playback_status = "Initializing audio output...".to_string();
-        let output_device = state.output_device.clone();
+        // Construct the audio playback entity. Audio backend init is
+        // deferred to `start_deferred_playback_init` (called below
+        // after the entity is in the entity map) so the 25–50ms cpal
+        // device-enumeration cost doesn't block the first frame.
+        let player = cx.new(|player_cx| {
+            player::PlayerEntity::new(
+                volume,
+                state.output_device.clone(),
+                catalog.clone(),
+                player_cx,
+            )
+        });
+        // Subscribe to typed events for cross-region coordination
+        // (track change, play/pause flip, auto-advance, etc.); the
+        // held subscription lives on `TempoApp` for its lifetime so
+        // events keep flowing until the app exits.
+        let player_subscription = cx.subscribe(&player, |this, _player, event, cx| {
+            this.handle_player_event(event, cx);
+        });
+        // Also observe untyped notifies so the player bar repaints
+        // when the playback tick advances. Today the player bar is
+        // rendered inside `TempoApp::render_player_bar` (parent
+        // owns the layout), so a player-side `cx.notify()` has to
+        // surface as a parent repaint to take effect. A future
+        // refactor that gives `PlayerEntity` its own `Render` impl
+        // and embeds it as a child element will localize the
+        // invalidation; until then, the tick rate is throttled to
+        // ~1 Hz inside the player so this is no worse than the
+        // pre-Entity-split baseline (which also did whole-tree
+        // repaints at 1 Hz).
+        let player_observation = cx.observe(&player, |_this, _player, cx| cx.notify());
 
         let initial_page = if roots.is_empty() {
             Page::Settings
@@ -1160,7 +1216,10 @@ impl TempoApp {
         let artist_table_scroll_top = state.artist_table_scroll_top;
         let album_grid_scroll_top = state.album_grid_scroll_top;
         let album_table_scroll_top = state.album_table_scroll_top;
-        let save_on_quit = cx.on_app_quit(|app, _cx| {
+        let save_on_quit = cx.on_app_quit(|app, cx| {
+            // Refresh denormalized snapshots one last time so the
+            // shutdown save reflects any in-flight player state.
+            app.refresh_player_state_snapshot(cx);
             perf::event("shutdown.app_quit", "saving_state");
             // Synchronous save at shutdown so the latest state is always
             // flushed even if the debounce window for the background save
@@ -1200,14 +1259,9 @@ impl TempoApp {
             back_history: Vec::new(),
             forward_history: Vec::new(),
             hovered_tooltip_id: None,
-            now_playing_info_hovered: false,
-            hovered_now_playing_link: None,
-            alt_pressed: false,
             tooltip: None,
             tooltip_generation: 0,
             playing_track: initial_playing_track,
-            is_playing: false,
-            playback_mode: PlaybackMode::Straight,
             context_menu_track: None,
             context_menu_position: Point::default(),
             playlist_context_menu: None,
@@ -1226,27 +1280,13 @@ impl TempoApp {
             artist_view_mode: state.artist_view_mode,
             album_view_mode: state.album_view_mode,
             queue: Vec::new(),
-            waveform_cache: Vec::new(),
-            waveform_loading: Vec::new(),
             library_roots: roots,
             playlists,
             theme_id,
             themes,
             library_root_label,
             library_status,
-            playback_status,
-            output_device,
-            output_menu_source: None,
-            output_menu_position: Point::default(),
             online_metadata_mode: state.online_metadata_mode,
-            volume,
-            pre_mute_volume: if volume > 0.0 {
-                volume
-            } else {
-                default_volume()
-            },
-            volume_dragging: false,
-            volume_bar_scroll_handle: gpui::ScrollHandle::new(),
             scan_progress: ScanProgress::default(),
             scan_errors: Vec::new(),
             scan_changed_tracks: false,
@@ -1271,7 +1311,11 @@ impl TempoApp {
             metadata_demand_queue,
             metadata_status_expanded: false,
             _metadata_worker: None,
-            playback,
+            player,
+            volume_snapshot: volume,
+            output_device_snapshot: state.output_device.clone(),
+            _player_subscription: player_subscription,
+            _player_observation: player_observation,
             _save_on_quit: Some(save_on_quit),
         };
 
@@ -1302,7 +1346,7 @@ impl TempoApp {
             || app.invalidate_track_indices(),
         );
         perf::time("startup.clamp_track_indices", "", || {
-            app.clamp_track_indices()
+            app.clamp_track_indices(cx)
         });
         perf::time("startup.start_library_event_loop", "", || {
             app.start_library_event_loop(event_rx, cx)
@@ -2619,10 +2663,9 @@ impl Render for TempoApp {
             .when(self.column_menu_open, |this| {
                 this.child(self.render_column_menu(cx))
             })
-            .when(
-                self.output_menu_source == Some(OutputMenuSource::Settings),
-                |this| this.child(self.settings_output_device_menu(cx)),
-            )
+            .when(self.player.read(cx).settings_output_menu_open(), |this| {
+                this.child(self.settings_output_device_menu(cx))
+            })
             .when_some(self.tooltip.clone(), |this, tooltip| {
                 this.child(self.render_tooltip(&tooltip))
             })
@@ -2660,7 +2703,7 @@ impl TempoApp {
             return;
         }
 
-        self.play_track(self.active_selected_track());
+        self.play_track(self.active_selected_track(), cx);
         cx.notify();
     }
 
@@ -2673,7 +2716,7 @@ impl TempoApp {
             return;
         }
 
-        self.toggle_playback();
+        self.toggle_playback(cx);
         cx.notify();
     }
 
@@ -2775,7 +2818,7 @@ impl TempoApp {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.play_random_track();
+        self.play_random_track(cx);
         cx.notify();
     }
 
