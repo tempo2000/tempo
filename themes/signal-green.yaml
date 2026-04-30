@@ -38,4 +38,4 @@ colors:
   transport_primary_bg: "#d8ffe0"
   transport_primary_fg: "#061008"
   album_tile_text: "#effff3"
-  love: "#a4efb4"
+  liked: "#ff5a6f"
