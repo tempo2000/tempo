@@ -1058,32 +1058,16 @@ impl TempoApp {
         // The full "{prefix}: looking for audio files..." / "{prefix}:
         // N discovered, N indexed" form is still produced for the
         // Settings page (`render_library_settings` calls
-        // `visible_scan_status()` which embeds this verbatim). For
-        // the top bar (`render_scan_status` →
-        // `visible_scan_status_without_errors`) we deliberately omit
-        // the counts because they update at high frequency during
-        // scans and the bare prefix is enough at-a-glance signal.
+        // `visible_scan_status()` which embeds this verbatim). The
+        // top bar used to render an abbreviated form here too, but
+        // it was redundant with the sidebar's own scan progress and
+        // was removed.
         let _ = progress;
         prefix.to_string()
     }
 
     pub(super) fn visible_scan_status(&self) -> String {
         self.visible_scan_status_with(self.library_status.clone())
-    }
-
-    pub(super) fn visible_scan_status_without_errors(&self) -> String {
-        if self.scan_progress.errors == 0 {
-            return self.visible_scan_status();
-        }
-
-        let error_suffix = format!(", {} errors", self.scan_progress.errors);
-        let library_status = self
-            .library_status
-            .strip_suffix(&error_suffix)
-            .unwrap_or(&self.library_status)
-            .to_string();
-
-        self.visible_scan_status_with(library_status)
     }
 
     pub(super) fn visible_scan_status_with(&self, library_status: String) -> String {

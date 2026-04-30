@@ -575,7 +575,13 @@ impl TempoApp {
                             .child(self.tab_title(self.active_tab())),
                     ),
             )
-            .child(self.render_scan_status(cx))
+            // Item count, "Monitoring"/"Scanning" status, and the
+            // errors badge used to live here next to the tab title.
+            // They were redundant with the sidebar (which shows the
+            // same scan progress and links to the dedicated Scan
+            // Errors page) and added visual noise to the header.
+            // The metadata-sync pill stays — it surfaces async
+            // network activity that has no other indicator.
             .when_some(self.render_metadata_status(cx), |this, status| {
                 this.child(status)
             })
@@ -667,52 +673,6 @@ impl TempoApp {
                     )
                 },
             )
-    }
-
-    pub(super) fn render_scan_status(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let colors = *self.colors();
-
-        div()
-            .text_xs()
-            .text_color(rgb(if self.is_scanning {
-                colors.accent
-            } else {
-                colors.text_faint
-            }))
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(self.visible_scan_status_without_errors())
-            .when(self.scan_progress.errors > 0, |this| {
-                let label = format!(
-                    "{} {}",
-                    self.scan_progress.errors,
-                    if self.scan_progress.errors == 1 {
-                        "error"
-                    } else {
-                        "errors"
-                    }
-                );
-
-                this.child(
-                    div()
-                        .id("scan-errors-toggle")
-                        .rounded_sm()
-                        .px_1()
-                        .cursor_pointer()
-                        .text_color(rgb(colors.accent))
-                        .hover(move |this| {
-                            this.bg(rgb(colors.button_hover))
-                                .text_color(rgb(colors.accent_soft))
-                        })
-                        .child(label)
-                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                            this.open_page(Page::ScanErrors);
-                            cx.stop_propagation();
-                            cx.notify();
-                        })),
-                )
-            })
     }
 
     pub(super) fn render_metadata_status(

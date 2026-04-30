@@ -86,6 +86,43 @@ enum Page {
     Settings,
 }
 
+/// Sub-section of the Settings page. The Settings page renders as a
+/// two-pane layout: a left nav listing these sections and a right
+/// detail pane that shows only the active section. Pagination-style
+/// (clicking swaps the visible section), not scroll-spy.
+///
+/// Runtime-only state — deliberately not persisted to `state.json`.
+/// Defaults to `Library` when the library has no roots configured (so
+/// the onboarding card lands where the user needs to take action),
+/// otherwise `Appearance`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum SettingsSection {
+    Appearance,
+    AudioOutput,
+    Library,
+    OnlineMetadata,
+}
+
+impl SettingsSection {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "Appearance",
+            Self::AudioOutput => "Audio Output",
+            Self::Library => "Library",
+            Self::OnlineMetadata => "Online Metadata",
+        }
+    }
+
+    pub(super) fn all() -> [Self; 4] {
+        [
+            Self::Appearance,
+            Self::AudioOutput,
+            Self::Library,
+            Self::OnlineMetadata,
+        ]
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum BrowseViewMode {
     Grid,
@@ -1791,6 +1828,10 @@ pub(crate) struct TempoApp {
     /// was opened. The dropdown panel anchors here. Updated each time
     /// the dropdown is toggled open.
     right_sidebar_view_menu_position: Point<Pixels>,
+    /// Currently visible section of the Settings page. Runtime-only
+    /// (not persisted) — initialized in `TempoApp::new` based on
+    /// whether any library roots are configured.
+    settings_section: SettingsSection,
     tracks: Vec<Track>,
     /// Reverse-index from `Track::path` to its position in `tracks`.
     /// Used by the scanner to upsert known tracks in O(1) instead of
@@ -2257,6 +2298,11 @@ impl TempoApp {
             right_sidebar_view: state.right_sidebar_view,
             right_sidebar_view_menu_open: false,
             right_sidebar_view_menu_position: Point::default(),
+            settings_section: if roots.is_empty() {
+                SettingsSection::Library
+            } else {
+                SettingsSection::Appearance
+            },
             track_path_index: build_track_path_index(&cached_tracks),
             library_size_bytes: cached_tracks.iter().map(|track| track.file_size).sum(),
             tracks: cached_tracks,
@@ -4380,6 +4426,19 @@ impl TempoApp {
                 player_cx.notify();
             }
             closed
+        }) {
+            closed = true;
+        }
+        // Output device picker (player-bar and Settings-anchored
+        // variants both use this). Without this branch the dropdown
+        // stays open until the user picks a device — see
+        // `PlayerEntity::close_output_menu`.
+        if self.player.update(cx, |player, player_cx| {
+            let was_open = player.output_menu_source().is_some();
+            if was_open {
+                player.close_output_menu(player_cx);
+            }
+            was_open
         }) {
             closed = true;
         }

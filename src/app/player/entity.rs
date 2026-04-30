@@ -1203,10 +1203,10 @@ impl PlayerEntity {
     }
 
     /// Close any open output device picker (player-bar or settings
-    /// anchored). Currently unused — clicks outside the menu are
-    /// handled by GPUI's overlay dismissal — but exposed so a future
-    /// `Esc`-to-close action can call into it directly.
-    #[allow(dead_code)]
+    /// anchored). Called by `TempoApp::close_transient_menus` so a
+    /// click anywhere outside the floating menu panel dismisses the
+    /// dropdown — matching the dismiss behavior of every other
+    /// transient menu in the app.
     pub(crate) fn close_output_menu(&mut self, cx: &mut Context<Self>) {
         if self.output_menu_source.is_some() {
             self.output_menu_source = None;
@@ -1218,8 +1218,9 @@ impl PlayerEntity {
     /// menu is currently open, if any. Used by `TempoApp::render` to
     /// decide whether to render the *Settings*-anchored variant of
     /// the dropdown (the player-anchored variant is rendered inside
-    /// `PlayerEntity::render` itself).
-    #[allow(dead_code)]
+    /// `PlayerEntity::render` itself), and by
+    /// `TempoApp::close_transient_menus` to detect outside-click
+    /// dismiss.
     pub(crate) fn output_menu_source(&self) -> Option<OutputMenuSource> {
         self.output_menu_source
     }

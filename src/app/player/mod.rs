@@ -1117,6 +1117,12 @@ fn settings_output_device_panel(
                     };
                     let output_name = device.name;
 
+                    // `menu_item_base` already wires a hover style
+                    // (bg=button_hover, text=text_strong) — adding a
+                    // second `.hover(...)` here panics with "hover
+                    // style already set" inside GPUI. The base style
+                    // is identical to what we want, so we just
+                    // override `text_color` for the *idle* state.
                     menu_item_base(
                         SharedString::from(format!("settings-output-device-{device_ix}")),
                         colors,
@@ -1128,10 +1134,6 @@ fn settings_output_device_panel(
                     } else {
                         colors.text
                     }))
-                    .hover(move |this| {
-                        this.bg(rgb(colors.button_hover))
-                            .text_color(rgb(colors.text_strong))
-                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_output_device(output_name.clone(), cx);
                         cx.notify();
