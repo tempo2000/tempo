@@ -14,7 +14,7 @@ use gpui::{
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     NavigationDirection, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
     ScrollStrategy, ScrollWheelEvent, SharedString, Styled, Subscription, UniformListScrollHandle,
-    Window, anchored, div, img, point, prelude::*, px, rgb, uniform_list,
+    Window, anchored, div, img, point, prelude::*, px, relative, rgb, uniform_list,
 };
 use rodio::{Decoder, Source as _};
 use serde::{Deserialize, Serialize};

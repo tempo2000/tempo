@@ -351,6 +351,7 @@ impl Render for PlayerEntity {
                 waveform,
                 waveform_loading,
                 morph_active,
+                is_playing,
                 colors,
                 self.waveform_seekbar_scroll_handle.clone(),
                 cx,
@@ -609,6 +610,7 @@ fn waveform_seekbar(
     waveform: Arc<[f32]>,
     loading: bool,
     morph_active: bool,
+    is_playing: bool,
     colors: ThemeColors,
     waveform_handle: gpui::ScrollHandle,
     cx: &mut Context<PlayerEntity>,
@@ -635,7 +637,13 @@ fn waveform_seekbar(
         Some(max) if max < waveform.len() => Arc::from(downsample_peaks(&waveform, max)),
         _ => Arc::clone(&waveform),
     };
-    let progress_segments = (bars.len() as f32 * progress).round() as usize;
+    // Continuous "bars played" measure — used both to fractionally
+    // fill the boundary bar (smooth played/idle transition) and to
+    // place the thin playhead line below at the exact sub-pixel
+    // x-position implied by `progress`. Keeping this as `f32`
+    // (rather than rounding to `usize`) is what eliminates the
+    // one-bar-at-a-time stepping the user sees as choppiness.
+    let progress_bars = bars.len() as f32 * progress;
     let bars_for_iter = Arc::clone(&bars);
 
     let bars_row = div()
@@ -656,18 +664,19 @@ fn waveform_seekbar(
                 .iter()
                 .copied()
                 .enumerate()
-                .map(move |(ix, height)| {
-                    waveform_bar(ix, height, progress_segments, loading, colors)
-                }),
+                .map(move |(ix, height)| waveform_bar(ix, height, progress_bars, loading, colors)),
         );
 
     // Wrap the bars row in `with_animation` whenever something is
     // moving — either the loading shimmer (heights regenerated each
-    // frame from a wall-clock phase inside `cached_waveform`) or
+    // frame from a wall-clock phase inside `cached_waveform`),
     // the per-column morph (heights lerped each frame inside
-    // `resolve_waveform_heights`). The animation's only job is to
-    // force a fresh paint at the window's refresh rate; the actual
-    // visual change is computed in the entity, not in this closure.
+    // `resolve_waveform_heights`), or steady-state playback (the
+    // playhead line + boundary-bar fill need to advance smoothly
+    // between the heartbeat's `cx.notify()` ticks). The animation's
+    // only job is to force a fresh paint at the window's refresh
+    // rate; the actual visual change is computed in the entity /
+    // `playback_position()` accessor, not in this closure.
     //
     // Phase 3 #17: this replaces the lone direct
     // `request_animation_frame` call in the codebase. Future
@@ -675,11 +684,15 @@ fn waveform_seekbar(
     // `with_animation` idiom.
     //
     // The animation IDs are distinct so that switching between
-    // "loading" and "morphing" mid-animation doesn't reset the
-    // wall-clock used by the shimmer. The looped 1500ms / 400ms
+    // "loading" / "morphing" / "playing" mid-animation doesn't
+    // reset wall-clock state used by the shimmer. The looped
     // periods are arbitrary — the closure is a no-op so the period
     // only affects how often the animation system re-evaluates
-    // (and therefore repaints).
+    // (and therefore repaints). 1s for steady-state playback is
+    // long enough to be cheap to drive yet short enough that
+    // GPUI keeps repainting at the window refresh rate; the
+    // animation system internally requests frames continuously
+    // for the duration of the current iteration.
     let bars_row: AnyElement = if loading {
         bars_row
             .with_animation(
@@ -696,8 +709,96 @@ fn waveform_seekbar(
                 |this, _delta| this,
             )
             .into_any_element()
+    } else if is_playing {
+        bars_row
+            .with_animation(
+                "waveform-playhead-tick",
+                Animation::new(Duration::from_millis(1000)).repeat(),
+                |this, _delta| this,
+            )
+            .into_any_element()
     } else {
         bars_row.into_any_element()
+    };
+
+    // Thin vertical playhead line, positioned continuously across
+    // the painted bars region.
+    //
+    // Naively using `left(relative(progress))` against the padded
+    // content box looks correct at `progress = 0` and `progress = 1`
+    // (both endpoints land exactly on the bars region's edges), but
+    // drifts in between because the bars row interleaves 1px gaps
+    // between bars: the *bars* consume `N*bar_w + (N-1)*1px` while
+    // a flat percentage interpolates over `N*(bar_w + gap)` worth of
+    // span. The user sees this as the line trailing the boundary
+    // fill at the start of the track and leading it at the end.
+    //
+    // To keep the line locked to the boundary fill at every
+    // sub-bar position, project `progress_bars` directly through
+    // the same `bar_width + gap` arithmetic used by the flex
+    // layout: integer-bars consume `bar_w + 1px` each, the
+    // fractional remainder consumes `bar_w` (no trailing gap on
+    // the boundary bar's played overlay).
+    //
+    // Falls back to a flat `relative(progress)` on the first frame
+    // before painted bounds are known (`bars_width <= 0`); the
+    // very next frame switches to the pixel-accurate path so the
+    // visible mismatch the user reported is gone.
+    let bar_count = bars.len() as f32;
+    let playhead_overlay = if bars_width > 16.0 && bar_count > 0.0 {
+        // 8px padding on each side (`.px_2()` on the bars row).
+        let content_width = bars_width - 16.0;
+        // 1px gap between bars; `bar_count - 1` gaps total.
+        let gap_total = (bar_count - 1.0).max(0.0);
+        let bar_width = ((content_width - gap_total) / bar_count).max(0.0);
+        let progress_bars_clamped = progress_bars.clamp(0.0, bar_count);
+        let whole = progress_bars_clamped.floor();
+        let frac = progress_bars_clamped - whole;
+        // Position relative to the seekbar's left edge: 8px of
+        // padding, then `whole` full bars-plus-gaps, then the
+        // fractional portion of the boundary bar (no gap after,
+        // since the played fill ends inside the bar).
+        let playhead_x = 8.0 + whole * (bar_width + 1.0) + frac * bar_width;
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.0))
+                    .bottom(px(4.0))
+                    .w(px(2.0))
+                    .ml(px(-1.0))
+                    .left(px(playhead_x))
+                    .rounded_full()
+                    .bg(rgb(colors.waveform_playhead)),
+            )
+    } else {
+        // Pre-paint fallback: `relative(...)` resolves against the
+        // padded content box (`px_2`), so the endpoints still land
+        // on the bars region.
+        let playhead_left_pct = progress.clamp(0.0, 1.0);
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .px_2()
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.0))
+                    .bottom(px(4.0))
+                    .w(px(2.0))
+                    .ml(px(-1.0))
+                    .left(relative(playhead_left_pct))
+                    .rounded_full()
+                    .bg(rgb(colors.waveform_playhead)),
+            )
     };
 
     div()
@@ -742,6 +843,7 @@ fn waveform_seekbar(
                 .bg(rgb(colors.waveform_line)),
         )
         .child(bars_row)
+        .child(playhead_overlay)
         .when(loading, |this| {
             this.child(
                 div()
@@ -823,42 +925,95 @@ fn downsample_peaks(src: &[f32], target_len: usize) -> Vec<f32> {
     out
 }
 
+/// Render a single waveform bar.
+///
+/// `progress_bars` is the **continuous** number of bars that have
+/// been played (e.g. `12.37` means bars `0..=11` are fully played
+/// and bar `12` is 37% played). This lets the played/idle boundary
+/// slide smoothly across the bar, instead of snapping a whole bar
+/// at a time as `playback_position` advances. The smoothness comes
+/// from two places working together:
+///
+/// 1. The fractional bar (the one straddling the playhead) is
+///    rendered as an idle bar with a played-color overlay clipped
+///    to the played fraction's width.
+/// 2. A thin playhead line is rendered separately by the caller at
+///    the exact sub-pixel x-position implied by `progress_bars`,
+///    so the visible playhead glides instead of stepping.
 fn waveform_bar(
     ix: usize,
     height: f32,
-    progress_segments: usize,
+    progress_bars: f32,
     loading: bool,
     colors: ThemeColors,
 ) -> impl IntoElement {
-    let played = ix < progress_segments;
-    let playhead = ix == progress_segments;
+    let ix_f = ix as f32;
+    // Bars whose right edge has been crossed are fully played.
+    let fully_played = ix_f + 1.0 <= progress_bars;
+    // The boundary bar — straddles the playhead. While the playhead
+    // is between `ix` and `ix + 1` we render an idle background
+    // with a left-aligned played overlay sized to the fractional
+    // played portion. `boundary_fraction` is 0.0 at the leading
+    // edge and 1.0 at the trailing edge.
+    let boundary_fraction = if fully_played {
+        // Already counted as fully played above; no overlay needed.
+        0.0
+    } else if progress_bars > ix_f {
+        (progress_bars - ix_f).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let on_boundary = !fully_played && boundary_fraction > 0.0;
     let peak = height > 44.0;
-    let color = if loading && peak {
+
+    // Base (idle/played) color — the overlay below paints the
+    // played portion on top of an idle background for the
+    // boundary bar.
+    let base_color = if loading && peak {
         colors.waveform_played
     } else if loading {
         colors.waveform_idle_peak
-    } else if playhead {
-        colors.waveform_playhead
-    } else if played && peak {
+    } else if fully_played && peak {
         colors.waveform_played_peak
-    } else if played {
+    } else if fully_played {
         colors.waveform_played
     } else if peak {
         colors.waveform_idle_peak
     } else {
         colors.waveform_idle
     };
+    let overlay_color = if peak {
+        colors.waveform_played_peak
+    } else {
+        colors.waveform_played
+    };
 
     div()
         .flex_1()
         .min_w(px(1.0))
-        .h(px(if playhead { 58.0 } else { height }))
+        .h(px(height))
         .rounded_full()
-        .bg(rgb(color))
-        .opacity(if loading || played || playhead {
+        .bg(rgb(base_color))
+        .opacity(if loading || fully_played || on_boundary {
             1.0
         } else {
             0.78
+        })
+        .when(on_boundary, |this| {
+            // Overlay the played fraction. `relative_overlay` style
+            // is achieved by giving the bar `relative` positioning
+            // implicitly via the absolute child — GPUI containers
+            // are flex/relative-friendly without an explicit prop.
+            this.relative().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(relative(boundary_fraction))
+                    .rounded_full()
+                    .bg(rgb(overlay_color)),
+            )
         })
 }
 
