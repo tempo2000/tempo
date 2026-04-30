@@ -1060,7 +1060,7 @@ impl TempoApp {
                     }
                 }),
             )
-            .child(self.render_browse_table_header(column_menu_kind, 34.0, &columns, cx))
+            .child(self.render_browse_table_header(column_menu_kind, 27.0, &columns, cx))
             .when(row_count == 0, |this| {
                 this.child(
                     div()
@@ -1533,7 +1533,7 @@ impl TempoApp {
                 "artist-row-{}",
                 artist.artist_id
             )))
-            .h(px(50.0))
+            .h(px(TABLE_ROW_H))
             .px_4()
             .flex()
             .items_center()
@@ -1577,7 +1577,7 @@ impl TempoApp {
                 "album-row-{}-{}",
                 album.artist_id, album.album_id
             )))
-            .h(px(50.0))
+            .h(px(TABLE_ROW_H))
             .px_4()
             .flex()
             .items_center()
@@ -1625,7 +1625,7 @@ impl TempoApp {
 
         div()
             .id(SharedString::from(format!("genre-row-{}", genre.key)))
-            .h(px(50.0))
+            .h(px(TABLE_ROW_H))
             .px_4()
             .flex()
             .items_center()
@@ -1664,25 +1664,10 @@ impl TempoApp {
             ArtistTableColumn::Artist => div()
                 .w(px(self.artist_table_column_width(column)))
                 .min_w_0()
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .text_color(rgb(colors.text_strong))
-                        .overflow_hidden()
-                        .text_ellipsis()
-                        .child(artist.name.clone()),
-                )
-                .when_some(artist.bio.as_ref(), |this, bio| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_faint))
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(bio.clone()),
-                    )
-                })
+                .text_color(rgb(colors.text_strong))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(artist.name.clone())
                 .into_any_element(),
             ArtistTableColumn::Albums => self
                 .cell(
@@ -2424,8 +2409,8 @@ impl TempoApp {
 
         div()
             .id(id)
-            .w(px(38.0))
-            .h(px(38.0))
+            .w(px(22.0))
+            .h(px(22.0))
             .flex_none()
             .rounded_sm()
             .border_1()
