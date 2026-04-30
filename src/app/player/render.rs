@@ -1136,12 +1136,34 @@ fn seekbar_menu(
 ) -> impl IntoElement + use<> {
     // BottomRight anchor with a small upward offset places the panel
     // just above the ✦ button rather than overlapping it.
-    menu_at(
-        position,
-        Corner::BottomRight,
-        point(px(8.0), px(-12.0)),
-        seekbar_menu_panel(fps_enabled, current_visualizer, colors, cx),
-    )
+    div()
+        .id("seekbar-menu-backdrop")
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|player, _: &MouseDownEvent, _window, cx| {
+                player.seekbar_menu_open = false;
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|player, _: &MouseDownEvent, _window, cx| {
+                player.seekbar_menu_open = false;
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        )
+        .child(menu_at(
+            position,
+            Corner::BottomRight,
+            point(px(8.0), px(-12.0)),
+            seekbar_menu_panel(fps_enabled, current_visualizer, colors, cx),
+        ))
 }
 
 fn seekbar_menu_panel(
@@ -1150,7 +1172,14 @@ fn seekbar_menu_panel(
     colors: ThemeColors,
     cx: &mut Context<PlayerEntity>,
 ) -> impl IntoElement + use<> {
-    let mut panel = menu_panel(200.0, colors).child(menu_header("Visualizer", colors));
+    let mut panel = menu_panel(200.0, colors)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _: &MouseDownEvent, _window, cx| {
+                cx.stop_propagation();
+            }),
+        )
+        .child(menu_header("Visualizer", colors));
     // Radio-style list of all four visualizers. Selected variant is
     // highlighted in `accent_soft` and shown with a check; clicking
     // any other variant flips the selection and persists it.
