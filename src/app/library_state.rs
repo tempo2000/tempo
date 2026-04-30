@@ -196,6 +196,7 @@ impl TempoApp {
             // `TempoApp`, so by the time we're saving, the layout is
             // already in its post-migration form.
             liked_column_migrated: true,
+            right_sidebar_view: self.right_sidebar_view,
         }
     }
 

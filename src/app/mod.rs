@@ -485,6 +485,26 @@ struct TrackDrag {
     position: gpui::Point<Pixels>,
 }
 
+/// Drag payload used when a row inside the Up Next sidebar is being
+/// dragged. Distinct from `TrackDrag` so a drop into the queue can
+/// tell whether to *insert* a new entry (`TrackDrag` from the main
+/// table / browse views) or *move* an existing one (`QueueRowDrag`
+/// originating in the queue itself).
+#[derive(Clone)]
+struct QueueRowDrag {
+    queue_position: usize,
+    /// Track index carried for completeness so future cross-list
+    /// drop targets (e.g. dragging a queue entry onto a playlist tab)
+    /// can resolve the underlying track without re-looking up via
+    /// `queue_position`. Currently only the queue itself is a drop
+    /// target so the field is read indirectly via `Render` only.
+    #[allow(dead_code)]
+    track_ix: usize,
+    title: SharedString,
+    artist: SharedString,
+    position: gpui::Point<Pixels>,
+}
+
 #[derive(Clone)]
 struct ColumnDrag {
     column: TableColumn,
@@ -591,8 +611,65 @@ impl TrackDrag {
     }
 }
 
+impl QueueRowDrag {
+    fn new(queue_position: usize, track_ix: usize, track: &Track) -> Self {
+        Self {
+            queue_position,
+            track_ix,
+            title: track.title.clone(),
+            artist: track.artist.clone(),
+            position: gpui::Point::default(),
+        }
+    }
+
+    fn position(mut self, position: gpui::Point<Pixels>) -> Self {
+        self.position = position;
+        self
+    }
+}
+
 impl Render for TrackDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .pl(self.position.x - px(18.0))
+            .pt(self.position.y - px(18.0))
+            .child(
+                div()
+                    .w(px(220.0))
+                    .h(px(42.0))
+                    .px_3()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x4b4f5a))
+                    .bg(rgb(0x202229))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .justify_center()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(0xf0f0f4))
+                            .child(self.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_color(rgb(0x9a9ea8))
+                            .child(self.artist.clone()),
+                    ),
+            )
+    }
+}
+
+impl Render for QueueRowDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // Visually identical to `TrackDrag` so an in-list reorder feels
+        // consistent with adding a new track from the main table.
         div()
             .pl(self.position.x - px(18.0))
             .pt(self.position.y - px(18.0))
@@ -640,6 +717,43 @@ struct Playlist {
 struct PlaylistContextMenu {
     playlist_ix: usize,
     position: Point<Pixels>,
+}
+
+/// Right-click menu state for an Up Next queue row in the right
+/// sidebar. `queue_position` is the index into `self.queue`; the menu
+/// resolves to a track via `self.queue[queue_position]` at action time
+/// (with bounds-checking, since concurrent mutations could shrink the
+/// queue between open and click).
+#[derive(Clone, Copy)]
+struct QueueContextMenu {
+    queue_position: usize,
+    position: Point<Pixels>,
+}
+
+/// Right-click menu state for a History row in the right sidebar.
+/// `history_index` indexes into `self.playback_history` (the
+/// underlying append-order vector, *not* the sorted display list) so
+/// a "Remove from history" action is stable even after re-sorts.
+#[derive(Clone, Copy)]
+struct HistoryContextMenu {
+    history_index: usize,
+    position: Point<Pixels>,
+}
+
+/// Which view the right (Up Next) sidebar is currently displaying.
+/// The header's "Up Next ▾" label opens a small dropdown that flips
+/// this enum; the body branches on it. Persisted in `state.json`.
+///
+/// `Playlist(usize)` shows a single playlist's tracks; the index is
+/// resolved against `self.playlists` at render time. Out-of-range
+/// indices fall back to the queue view (so a deleted playlist
+/// doesn't strand the sidebar).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum RightSidebarView {
+    #[default]
+    Queue,
+    History,
+    Playlist(usize),
 }
 
 /// Inline-rename state for a sidebar playlist nav item. Holds the
@@ -926,6 +1040,11 @@ struct AppState {
     /// restarts.
     #[serde(default)]
     liked_column_migrated: bool,
+    /// Persisted choice of which view the right (Up Next) sidebar
+    /// shows. Defaults to `Queue` for users who didn't have this
+    /// field in their saved state.
+    #[serde(default)]
+    right_sidebar_view: RightSidebarView,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -982,6 +1101,7 @@ impl Default for AppState {
             // so the migration is a no-op. Mark it done so we don't
             // re-run it spuriously on the second launch.
             liked_column_migrated: true,
+            right_sidebar_view: RightSidebarView::default(),
         }
     }
 }
@@ -1358,6 +1478,23 @@ pub(crate) struct TempoApp {
     /// shows a centered dialog asking for confirmation; `None` means no
     /// dialog is open.
     playlist_delete_confirm: Option<usize>,
+    /// Right-click context menu state for an Up Next queue row.
+    /// `None` means no menu is open. Mirrors `playlist_context_menu`.
+    queue_context_menu: Option<QueueContextMenu>,
+    /// Right-click context menu state for a History row in the right
+    /// sidebar. `None` means no menu is open.
+    history_context_menu: Option<HistoryContextMenu>,
+    /// Which view the right (Up Next) sidebar shows. Persisted in
+    /// `state.json`. The header label acts as a dropdown trigger that
+    /// flips this between `Queue` and `History`.
+    right_sidebar_view: RightSidebarView,
+    /// Whether the right-sidebar view-picker dropdown is currently
+    /// open. The trigger lives in the queue header (`render_queue`).
+    right_sidebar_view_menu_open: bool,
+    /// Mouse-down position recorded when the view-picker dropdown
+    /// was opened. The dropdown panel anchors here. Updated each time
+    /// the dropdown is toggled open.
+    right_sidebar_view_menu_position: Point<Pixels>,
     tracks: Vec<Track>,
     /// Reverse-index from `Track::path` to its position in `tracks`.
     /// Used by the scanner to upsert known tracks in O(1) instead of
@@ -1410,6 +1547,15 @@ pub(crate) struct TempoApp {
     genre_table_sort_column: GenreTableColumn,
     genre_table_sort_direction: SortDirection,
     queue: Vec<usize>,
+    /// Index into `self.queue` of the entry that is currently
+    /// playing, or was most recently played from the queue. `None`
+    /// means playback is not "in" the queue right now (e.g. the user
+    /// double-clicked a row in the main table, or the queue was
+    /// empty when the current track started). Used purely for the
+    /// Up Next sidebar's active-row indicator and for forward
+    /// auto-advance; clearing the queue or playing from outside the
+    /// queue resets it to `None`.
+    queue_cursor: Option<usize>,
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
     playback_history: Vec<PlaybackHistoryEntry>,
@@ -1435,6 +1581,19 @@ pub(crate) struct TempoApp {
     scan_errors_scroll_handle: UniformListScrollHandle,
     playback_history_scroll_handle: UniformListScrollHandle,
     liked_scroll_handle: UniformListScrollHandle,
+    /// Scroll handle for the Up Next queue's `uniform_list` in the
+    /// right sidebar. Kept on the app so scroll position survives
+    /// across re-renders (e.g. theme changes, view-picker toggles).
+    queue_sidebar_scroll_handle: UniformListScrollHandle,
+    /// Scroll handle for the History view's `uniform_list` in the
+    /// right sidebar.
+    history_sidebar_scroll_handle: UniformListScrollHandle,
+    /// Scroll handle for the per-playlist view's `uniform_list` in
+    /// the right sidebar. Shared across playlists; resets each time
+    /// the user switches which playlist is being viewed (which is
+    /// the natural behavior of `track_scroll` against a list whose
+    /// `item_count` changed).
+    playlist_sidebar_scroll_handle: UniformListScrollHandle,
     table_is_scrolling: bool,
     table_scroll_generation: u64,
     catalog: Option<CatalogStore>,
@@ -1713,6 +1872,11 @@ impl TempoApp {
             playlist_rename: None,
             playlist_rename_focus_handle: None,
             playlist_delete_confirm: None,
+            queue_context_menu: None,
+            history_context_menu: None,
+            right_sidebar_view: state.right_sidebar_view,
+            right_sidebar_view_menu_open: false,
+            right_sidebar_view_menu_position: Point::default(),
             track_path_index: build_track_path_index(&cached_tracks),
             library_size_bytes: cached_tracks.iter().map(|track| track.file_size).sum(),
             tracks: cached_tracks,
@@ -1737,6 +1901,7 @@ impl TempoApp {
             genre_table_sort_column: state.genre_table_sort_column,
             genre_table_sort_direction: state.genre_table_sort_direction,
             queue: Vec::new(),
+            queue_cursor: None,
             library_roots: roots,
             playlists,
             theme_id,
@@ -1761,6 +1926,9 @@ impl TempoApp {
             scan_errors_scroll_handle: UniformListScrollHandle::new(),
             playback_history_scroll_handle: UniformListScrollHandle::new(),
             liked_scroll_handle: UniformListScrollHandle::new(),
+            queue_sidebar_scroll_handle: UniformListScrollHandle::new(),
+            history_sidebar_scroll_handle: UniformListScrollHandle::new(),
+            playlist_sidebar_scroll_handle: UniformListScrollHandle::new(),
             table_is_scrolling: false,
             table_scroll_generation: 0,
             catalog,
@@ -3592,6 +3760,15 @@ impl Render for TempoApp {
             })
             .when(self.playlist_delete_confirm.is_some(), |this| {
                 this.child(self.render_playlist_delete_confirm(cx))
+            })
+            .when(self.queue_context_menu.is_some(), |this| {
+                this.child(self.render_queue_context_menu(cx))
+            })
+            .when(self.history_context_menu.is_some(), |this| {
+                this.child(self.render_history_context_menu(cx))
+            })
+            .when(self.right_sidebar_view_menu_open, |this| {
+                this.child(self.render_right_sidebar_view_menu(cx))
             })
             .when(self.column_menu_open, |this| {
                 this.child(self.render_column_menu(cx))

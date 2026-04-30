@@ -144,11 +144,26 @@ impl TempoApp {
     }
 
     pub(super) fn remove_track_from_queue(&mut self, removed_ix: usize) {
-        self.queue = self
+        // Track every dropped queue position so we can adjust the
+        // cursor; positions to the left of the cursor that were
+        // dropped shift it left, and a drop *at* the cursor clears
+        // it altogether (the cursor entry no longer exists).
+        let cursor = self.queue_cursor;
+        let mut new_cursor = cursor;
+        let mut dropped_before_cursor: usize = 0;
+        let new_queue: Vec<usize> = self
             .queue
             .iter()
-            .filter_map(|track_ix| {
+            .enumerate()
+            .filter_map(|(position, track_ix)| {
                 if *track_ix == removed_ix {
+                    if let Some(c) = cursor {
+                        if position == c {
+                            new_cursor = None;
+                        } else if position < c {
+                            dropped_before_cursor += 1;
+                        }
+                    }
                     None
                 } else if *track_ix > removed_ix {
                     Some(*track_ix - 1)
@@ -157,10 +172,113 @@ impl TempoApp {
                 }
             })
             .collect();
+        self.queue = new_queue;
+        if let Some(c) = new_cursor {
+            self.queue_cursor = Some(c.saturating_sub(dropped_before_cursor));
+        } else {
+            self.queue_cursor = None;
+        }
     }
 
     pub(super) fn queue_track(&mut self, track_ix: usize) {
         self.queue_track_at_end(track_ix);
+    }
+
+    /// Clear every entry from the Up Next queue and re-collapse the
+    /// right sidebar (it auto-shows when items are added; mirroring
+    /// that on clear keeps the reopen-arrow gating in `library_view`
+    /// consistent). Bound to the `✕` button in the queue header.
+    pub(super) fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        if self.queue.is_empty() {
+            return;
+        }
+        self.queue.clear();
+        self.queue_cursor = None;
+        self.right_sidebar_collapsed = true;
+        self.queue_context_menu = None;
+        cx.notify();
+    }
+
+    /// Remove the entry at `queue_position`. Out-of-range calls are
+    /// silently ignored so racing clicks can't panic the app. Adjusts
+    /// the active-row cursor: removing the cursor entry drops it,
+    /// removing an entry above shifts it left so it still points at
+    /// the same logical row.
+    pub(super) fn remove_queue_entry(&mut self, queue_position: usize, cx: &mut Context<Self>) {
+        if queue_position >= self.queue.len() {
+            return;
+        }
+        self.queue.remove(queue_position);
+        if let Some(cursor) = self.queue_cursor {
+            self.queue_cursor = if cursor == queue_position {
+                None
+            } else if cursor > queue_position {
+                Some(cursor - 1)
+            } else {
+                Some(cursor)
+            };
+        }
+        self.queue_context_menu = None;
+        cx.notify();
+    }
+
+    /// Move the entry at `from` to `to` within the queue. `to` is
+    /// interpreted in the *pre-removal* index space (i.e. the visible
+    /// drop target index) so callers don't have to special-case the
+    /// "drop after the source" math themselves. The cursor follows
+    /// whichever entry it pointed at: if it pointed at `from`, it
+    /// tracks the moved entry to its new position; otherwise it
+    /// shifts to keep pointing at the same logical entry.
+    pub(super) fn move_queue_entry(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.queue.len() || from == to {
+            return;
+        }
+        let value = self.queue.remove(from);
+        let adjusted = if from < to { to - 1 } else { to };
+        let clamped = adjusted.min(self.queue.len());
+        self.queue.insert(clamped, value);
+        if let Some(cursor) = self.queue_cursor {
+            self.queue_cursor = Some(if cursor == from {
+                // Cursor entry itself was the one moved.
+                clamped
+            } else if from < cursor && cursor <= clamped {
+                // Removed something before the cursor and reinserted
+                // at-or-after it -- cursor effectively shifts left by 1.
+                cursor - 1
+            } else if clamped <= cursor && cursor < from {
+                // Inserted before the cursor -- cursor shifts right by 1.
+                cursor + 1
+            } else {
+                cursor
+            });
+        }
+        cx.notify();
+    }
+
+    /// Insert `track_ix` at `position` in the queue. Used by drops
+    /// from the main track table onto a queue row (insert above) or
+    /// onto the bottom drop zone (append). Out-of-bounds `track_ix`
+    /// is rejected; out-of-bounds `position` is clamped. Shifts the
+    /// cursor right by 1 if the insert lands at or before it so it
+    /// still points at the same logical entry.
+    pub(super) fn insert_in_queue(
+        &mut self,
+        position: usize,
+        track_ix: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if track_ix >= self.tracks.len() {
+            return;
+        }
+        let position = position.min(self.queue.len());
+        self.queue.insert(position, track_ix);
+        if let Some(cursor) = self.queue_cursor
+            && position <= cursor
+        {
+            self.queue_cursor = Some(cursor + 1);
+        }
+        self.right_sidebar_collapsed = false;
+        cx.notify();
     }
 
     pub(super) fn queue_track_at_start(&mut self, track_ix: usize) {
@@ -169,6 +287,11 @@ impl TempoApp {
         }
 
         self.queue.insert(0, track_ix);
+        // Inserting at 0 shifts every queue entry right by one, so
+        // the cursor (if set) needs to follow.
+        if let Some(cursor) = self.queue_cursor {
+            self.queue_cursor = Some(cursor + 1);
+        }
         self.right_sidebar_collapsed = false;
         self.context_menu_track = None;
     }
@@ -253,6 +376,10 @@ impl TempoApp {
             }
             self.playing_track = 0;
             self.context_menu_track = None;
+            // Library went empty -- the queue is about to be (or has
+            // been) cleared by the same library reload, so the cursor
+            // can't point at anything meaningful anymore.
+            self.queue_cursor = None;
             // The previous monolithic implementation merely flipped
             // `is_playing = false` without stopping the audio
             // backend; calling `player.stop()` here also drains the
@@ -310,6 +437,13 @@ impl TempoApp {
         record_history: bool,
         cx: &mut Context<Self>,
     ) {
+        // Any non-queue-driven play invalidates the queue cursor: the
+        // user is now playing something *outside* the Up Next list,
+        // so the active-row indicator should disappear from the
+        // queue. The two queue-driven paths (`play_queue_entry` and
+        // queue auto-advance in `play_finished_track`) re-set the
+        // cursor *after* this call returns.
+        self.queue_cursor = None;
         let start = Instant::now();
         let Some(track) = self.tracks.get(track_ix) else {
             return;
@@ -457,8 +591,21 @@ impl TempoApp {
     /// Auto-advance: pick the next track per the active playback
     /// mode, or stop at end-of-list for `Straight`. Called from the
     /// `PlayerEvent::TrackFinished` arm of `handle_player_event`.
+    ///
+    /// The Up Next queue takes priority over the active table view in
+    /// every mode except `Loop` (which always re-plays the current
+    /// track). The queue is treated as a list with a *cursor* (see
+    /// `self.queue_cursor`) rather than a destructive FIFO -- finishing
+    /// a track advances the cursor by one but leaves entries in place
+    /// so the user can scrub backward through the visible queue.
     pub(super) fn play_finished_track(&mut self, cx: &mut Context<Self>) {
         let mode = self.player.read(cx).playback_mode();
+        if !matches!(mode, PlaybackMode::Loop)
+            && let Some(next_position) = self.next_queue_position_valid()
+        {
+            self.play_queue_entry(next_position, cx);
+            return;
+        }
         match mode {
             PlaybackMode::Loop => self.play_track(self.playing_track, cx),
             PlaybackMode::Shuffle => self.play_random_track(cx),
@@ -468,7 +615,11 @@ impl TempoApp {
                 } else {
                     // End-of-list: surface a status string but keep
                     // the now-playing strip in place so the user can
-                    // still hit play again.
+                    // still hit play again. Drop the queue cursor so
+                    // the Up Next sidebar's active-row indicator
+                    // disappears -- nothing is playing from the
+                    // queue anymore.
+                    self.queue_cursor = None;
                     self.player.update(cx, |player, cx| {
                         player.stop(cx);
                         player.playback_status = "Playback finished".to_string();
@@ -476,6 +627,51 @@ impl TempoApp {
                 }
             }
         }
+    }
+
+    /// Pick the next valid queue position to play, advancing past any
+    /// entries whose stored index no longer points into `self.tracks`
+    /// (a defensive measure against rescans that shifted indices).
+    /// Returns `None` once we reach the end of the queue without
+    /// finding a valid entry; the caller falls back to mode-based
+    /// selection in that case.
+    ///
+    /// Starts from `queue_cursor + 1` if a cursor exists (auto-advance
+    /// from queue), or from `0` if the cursor is `None` (fresh start
+    /// into the queue).
+    fn next_queue_position_valid(&self) -> Option<usize> {
+        let mut pos = match self.queue_cursor {
+            Some(cursor) => cursor + 1,
+            None => 0,
+        };
+        while pos < self.queue.len() {
+            if self.queue[pos] < self.tracks.len() {
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    /// Play the queue entry at `queue_position`, leaving every queue
+    /// entry in place and updating the cursor so the Up Next sidebar
+    /// indicator follows the active row. Used by manual click on a
+    /// queue row, the queue context menu's "Play now", and the
+    /// auto-advance path in `play_finished_track`.
+    pub(super) fn play_queue_entry(&mut self, queue_position: usize, cx: &mut Context<Self>) {
+        let Some(track_ix) = self.queue.get(queue_position).copied() else {
+            return;
+        };
+        if track_ix >= self.tracks.len() {
+            return;
+        }
+        // `play_track_with_history` clears `queue_cursor` as part of
+        // its general "any non-queue-driven play invalidates the
+        // cursor" rule. Re-set the cursor *after* the call so it
+        // reflects the entry we just played.
+        self.play_track_with_history(track_ix, true, cx);
+        self.queue_cursor = Some(queue_position);
+        self.queue_context_menu = None;
     }
 
     pub(super) fn next_track_after(&self, track_ix: usize) -> Option<usize> {

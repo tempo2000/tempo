@@ -290,7 +290,17 @@ impl TempoApp {
             return row;
         }
 
-        row.on_click(cx.listener(move |this, _, _, cx| {
+        row.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            // Ctrl+click opens the playlist in the right sidebar
+            // instead of taking over the main view with a new tab.
+            if event.modifiers().control {
+                this.right_sidebar_view = RightSidebarView::Playlist(ix);
+                this.right_sidebar_collapsed = false;
+                this.right_sidebar_view_menu_open = false;
+                this.save_app_state();
+                cx.notify();
+                return;
+            }
             this.open_playlist_tab(ix);
             cx.notify();
         }))
@@ -454,7 +464,20 @@ impl TempoApp {
                     .text_color(rgb(colors.text_faint))
                     .child(count.into()),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                // Ctrl+click on the History nav item flips the right
+                // sidebar to its History view instead of navigating
+                // away from the current page. Other nav items don't
+                // have meaningful right-sidebar peers yet so they
+                // ignore the modifier.
+                if event.modifiers().control && target == Page::PlaybackHistory {
+                    this.right_sidebar_view = RightSidebarView::History;
+                    this.right_sidebar_collapsed = false;
+                    this.right_sidebar_view_menu_open = false;
+                    this.save_app_state();
+                    cx.notify();
+                    return;
+                }
                 if target == Page::Library {
                     this.open_all_music_tab();
                 } else {
@@ -554,10 +577,71 @@ impl TempoApp {
     pub(super) fn render_queue(&self, cx: &mut Context<Self>) -> AnyElement {
         let collapsed = self.right_sidebar_collapsed;
         let colors = *self.colors();
+        // Sanitize the view: a Playlist(ix) variant becomes Queue if
+        // the playlist was deleted out from under us. This keeps the
+        // sidebar from disappearing on a stale persisted state.
+        let view = self.sanitized_right_sidebar_view();
 
-        if collapsed || self.queue.is_empty() {
+        // Pre-filter the queue to drop stale indices (indices >=
+        // tracks.len() can linger after a rescan). The same filtered
+        // list is fed to both the row count and the virtual list's
+        // processor so they stay in sync.
+        let queue_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .copied()
+            .filter(|track_ix| *track_ix < self.tracks.len())
+            .collect();
+        let queue_empty = queue_indices.is_empty();
+        let history_indices = self.sorted_playback_history_indices();
+        let history_empty = history_indices.is_empty();
+        // Hide the right sidebar entirely only if there is genuinely
+        // nothing the user could ever switch to. Playlists count as
+        // potential content even when empty so a ctrl+click on a
+        // newly-created playlist still surfaces the sidebar.
+        let nothing_to_show = queue_empty && history_empty && self.playlists.is_empty();
+
+        let playlist_track_ix_for_view = match view {
+            RightSidebarView::Playlist(ix) => Some(self.playlist_track_indices(ix)),
+            _ => None,
+        };
+
+        let active_view_empty = match view {
+            RightSidebarView::Queue => queue_empty,
+            RightSidebarView::History => history_empty,
+            RightSidebarView::Playlist(_) => playlist_track_ix_for_view
+                .as_ref()
+                .map(|ix| ix.is_empty())
+                .unwrap_or(true),
+        };
+
+        if collapsed || nothing_to_show || active_view_empty {
             return div().w(px(0.0)).flex_none().into_any_element();
         }
+
+        let count_text = match view {
+            RightSidebarView::Queue => format!("{} tracks", queue_indices.len()),
+            RightSidebarView::History => format!("{} plays", history_indices.len()),
+            RightSidebarView::Playlist(_) => format!(
+                "{} tracks",
+                playlist_track_ix_for_view
+                    .as_ref()
+                    .map(|ix| ix.len())
+                    .unwrap_or(0)
+            ),
+        };
+
+        let body: AnyElement = match view {
+            RightSidebarView::Queue => self
+                .render_queue_virtual_list(queue_indices, cx)
+                .into_any_element(),
+            RightSidebarView::History => self
+                .render_history_virtual_list(history_indices, cx)
+                .into_any_element(),
+            RightSidebarView::Playlist(_) => self
+                .render_playlist_virtual_list(playlist_track_ix_for_view.unwrap_or_default(), cx)
+                .into_any_element(),
+        };
 
         div()
             .w(px(RIGHT_SIDEBAR_W))
@@ -587,51 +671,247 @@ impl TempoApp {
                             .child(self.sidebar_button("›", "toggle-right-sidebar").on_click(
                                 cx.listener(|this, _, _, cx| {
                                     this.right_sidebar_collapsed = !this.right_sidebar_collapsed;
+                                    this.right_sidebar_view_menu_open = false;
                                     cx.notify();
                                 }),
                             ))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(colors.text_strong))
-                                    .child("Up Next"),
-                            ),
+                            .child(self.render_right_sidebar_view_trigger(cx)),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(colors.text_faint))
-                            .child(format!("{} tracks", self.queue.len())),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(colors.text_faint))
+                                    .child(count_text),
+                            )
+                            // Clear-queue button only makes sense in
+                            // the Queue view; History has no
+                            // user-visible clear action yet.
+                            .when(matches!(view, RightSidebarView::Queue), |this| {
+                                this.child(self.sidebar_button("✕", "clear-queue").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.clear_queue(cx);
+                                    }),
+                                ))
+                            }),
                     ),
             )
-            .child(
-                div().w(px(RIGHT_SIDEBAR_W)).children(
-                    self.queue
-                        .iter()
-                        .filter(|track_ix| **track_ix < self.tracks.len())
-                        .enumerate()
-                        .map(|(ix, track_ix)| self.render_queue_row(ix, &self.tracks[*track_ix])),
-                ),
-            )
+            .child(body)
             .into_any_element()
     }
 
-    pub(super) fn render_queue_row(&self, ix: usize, track: &Track) -> impl IntoElement {
-        let active = ix == 0;
+    /// Virtualized list of Up Next queue rows. Reuses the
+    /// `uniform_list` pattern from the History page / Liked page so
+    /// only the visible rows are constructed each frame -- a 10k-track
+    /// queue still renders in O(viewport) time. The end-of-list drop
+    /// zone is appended *after* the virtual list so dropping past the
+    /// last visible item still appends.
+    fn render_queue_virtual_list(
+        &self,
+        queue_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let item_count = queue_indices.len();
+        let scroll_handle = self.queue_sidebar_scroll_handle.clone();
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(
+                uniform_list(
+                    "queue-rows",
+                    item_count,
+                    cx.processor(move |this, range: Range<usize>, _window, cx| {
+                        let _build_span = perf::span(
+                            "queue.uniform_list.build",
+                            format!(
+                                "rows={} range={}..{}",
+                                range.end.saturating_sub(range.start),
+                                range.start,
+                                range.end
+                            ),
+                        );
+                        range
+                            .filter_map(|row_ix| {
+                                let track_ix = queue_indices.get(row_ix).copied()?;
+                                let track = this.tracks.get(track_ix)?;
+                                Some(
+                                    this.render_queue_row(row_ix, track_ix, track, cx)
+                                        .into_any_element(),
+                                )
+                            })
+                            .collect()
+                    }),
+                )
+                .flex_1()
+                .min_h_0()
+                .track_scroll(scroll_handle),
+            )
+            // End-of-queue drop zone so users can drop a row past the
+            // last item to append. Sits below the virtual list as a
+            // fixed 24px strip.
+            .child(self.render_queue_end_drop_zone(cx))
+    }
+
+    /// Virtualized list of playback history rows.
+    fn render_history_virtual_list(
+        &self,
+        history_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let item_count = history_indices.len();
+        let scroll_handle = self.history_sidebar_scroll_handle.clone();
+        let colors = *self.colors();
+
+        div().flex_1().min_h_0().child(
+            uniform_list(
+                "history-rows",
+                item_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    let _build_span = perf::span(
+                        "history_sidebar.uniform_list.build",
+                        format!(
+                            "rows={} range={}..{}",
+                            range.end.saturating_sub(range.start),
+                            range.start,
+                            range.end
+                        ),
+                    );
+                    range
+                        .filter_map(|row_ix| {
+                            let history_index = history_indices.get(row_ix).copied()?;
+                            let entry = this.playback_history.get(history_index)?;
+                            let resolved = this
+                                .tracks
+                                .iter()
+                                .position(|track| track.path == entry.track_path);
+                            Some(
+                                this.render_history_row(history_index, entry, resolved, colors, cx)
+                                    .into_any_element(),
+                            )
+                        })
+                        .collect()
+                }),
+            )
+            .size_full()
+            .track_scroll(scroll_handle),
+        )
+    }
+
+    /// Header label that doubles as a click target to toggle the
+    /// view-picker dropdown. Renders the active view's name plus a
+    /// chevron, matching the player-bar output-device dropdown
+    /// pattern.
+    fn render_right_sidebar_view_trigger(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let label: SharedString = match self.sanitized_right_sidebar_view() {
+            RightSidebarView::Queue => "Up Next".into(),
+            RightSidebarView::History => "History".into(),
+            RightSidebarView::Playlist(ix) => self
+                .playlists
+                .get(ix)
+                .map(|playlist| SharedString::from(playlist.name.clone()))
+                .unwrap_or_else(|| "Up Next".into()),
+        };
+
+        div()
+            .id("right-sidebar-view-trigger")
+            .flex()
+            .items_center()
+            .gap_1()
+            .cursor_pointer()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_strong))
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .max_w(px(160.0))
+                    .child(label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child("▾"),
+            )
+            .hover(move |this| this.text_color(rgb(colors.text)))
+            // We use `on_mouse_down` (not `on_click`) so the menu can
+            // anchor at the click position. Stop propagation so the
+            // newly-opened menu's backdrop doesn't immediately close
+            // the menu on the same mouse-down.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    let opening = !this.right_sidebar_view_menu_open;
+                    this.right_sidebar_view_menu_open = opening;
+                    if opening {
+                        this.right_sidebar_view_menu_position = event.position;
+                    }
+                    this.queue_context_menu = None;
+                    this.history_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 24px-tall drop target appended after the last queue row so
+    /// drops past the end of the list are accepted. Visually empty in
+    /// the resting state; styled drop indicator could be added later.
+    fn render_queue_end_drop_zone(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let queue_len = self.queue.len();
+        div()
+            .id("queue-end-drop-zone")
+            .h(px(24.0))
+            .w(px(RIGHT_SIDEBAR_W))
+            .on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
+                this.insert_in_queue(queue_len, drag.track_ix, cx);
+            }))
+            .on_drop(cx.listener(move |this, drag: &QueueRowDrag, _window, cx| {
+                this.move_queue_entry(drag.queue_position, queue_len, cx);
+            }))
+    }
+
+    pub(super) fn render_queue_row(
+        &self,
+        ix: usize,
+        track_ix: usize,
+        track: &Track,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // Active row tracks the queue cursor (which entry is currently
+        // playing from the queue). When nothing is playing from the
+        // queue (`queue_cursor == None`), no row is highlighted.
+        let active = self.queue_cursor == Some(ix);
         let colors = *self.colors();
         let bg = if active {
             colors.queue_active
         } else {
             colors.queue
         };
+        let drag_track = track.clone();
+        let row_id = SharedString::from(format!("queue-row-{ix}"));
 
         div()
+            .id(row_id)
             .h(px(41.0))
             .px_3()
             .flex()
             .items_center()
             .gap_2()
             .bg(rgb(bg))
+            .cursor_pointer()
+            .hover(move |this| this.bg(rgb(colors.queue_active)))
             .child(
                 div()
                     .w(px(22.0))
@@ -674,6 +954,46 @@ impl TempoApp {
                     .text_color(rgb(colors.text_faint))
                     .child(track.duration.clone()),
             )
+            // Left-click: play this queue entry. The entry stays in
+            // place; only the cursor moves. That keeps the visible
+            // queue intact so the user can scrub backward through
+            // recently-played queue items if they want.
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.play_queue_entry(ix, cx);
+                cx.notify();
+            }))
+            // Right-click: open the queue context menu anchored at the
+            // mouse-down position.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.queue_context_menu = Some(QueueContextMenu {
+                        queue_position: ix,
+                        position: event.position,
+                    });
+                    this.history_context_menu = None;
+                    this.right_sidebar_view_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            // Drag source: in-queue reorder + cross-list moves.
+            .on_drag(
+                QueueRowDrag::new(ix, track_ix, &drag_track),
+                |drag: &QueueRowDrag, position, _, cx| {
+                    let preview = drag.clone().position(position);
+                    cx.new(|_| preview)
+                },
+            )
+            // Drop target for an external `TrackDrag`: insert above
+            // this row.
+            .on_drop(cx.listener(move |this, drag: &TrackDrag, _window, cx| {
+                this.insert_in_queue(ix, drag.track_ix, cx);
+            }))
+            // Drop target for a `QueueRowDrag`: move within the queue.
+            .on_drop(cx.listener(move |this, drag: &QueueRowDrag, _window, cx| {
+                this.move_queue_entry(drag.queue_position, ix, cx);
+            }))
     }
 
     /// Right-click context menu for sidebar playlist nav items. The
@@ -883,5 +1203,620 @@ impl TempoApp {
                             ),
                     ),
             )
+    }
+
+    fn render_history_row(
+        &self,
+        history_index: usize,
+        entry: &PlaybackHistoryEntry,
+        resolved_track_ix: Option<usize>,
+        colors: ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let row_id = SharedString::from(format!("history-row-{history_index}"));
+        let title_color = if resolved_track_ix.is_some() {
+            colors.text_strong
+        } else {
+            colors.text_faint
+        };
+        let subtitle_color = if resolved_track_ix.is_some() {
+            colors.text_muted
+        } else {
+            colors.text_faint
+        };
+        let dim = resolved_track_ix.is_none();
+
+        let mut row = div()
+            .id(row_id)
+            .h(px(41.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(rgb(colors.queue))
+            .when(!dim, |this| {
+                this.cursor_pointer()
+                    .hover(move |this| this.bg(rgb(colors.queue_active)))
+            })
+            .child(
+                div()
+                    .w(px(22.0))
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child(Self::format_history_relative(entry.played_at_unix_secs)),
+            );
+
+        // Optional artwork tile when the track is still in the
+        // library; otherwise a small placeholder so the layout stays
+        // stable.
+        if let Some(track_ix) = resolved_track_ix {
+            row = row.child(artwork::album_tile(&self.tracks[track_ix], 28.0, colors));
+        } else {
+            row = row.child(
+                div()
+                    .w(px(28.0))
+                    .h(px(28.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(colors.border))
+                    .bg(rgb(colors.panel))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child("♪"),
+            );
+        }
+
+        row = row
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(title_color))
+                            .child(SharedString::from(entry.title.clone())),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(subtitle_color))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(SharedString::from(entry.artist.clone())),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(42.0))
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child(SharedString::from(entry.duration.clone())),
+            )
+            // Right-click menu (works whether or not the track resolves
+            // -- the "Remove from history" action stays available).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    this.history_context_menu = Some(HistoryContextMenu {
+                        history_index,
+                        position: event.position,
+                    });
+                    this.queue_context_menu = None;
+                    this.right_sidebar_view_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+
+        if let Some(track_ix) = resolved_track_ix {
+            row = row.on_click(cx.listener(move |this, _, _, cx| {
+                if track_ix < this.tracks.len() {
+                    this.play_track(track_ix, cx);
+                    cx.notify();
+                }
+            }));
+        }
+
+        row
+    }
+
+    /// Format a unix-secs timestamp as a short relative-time label
+    /// suitable for the narrow history-row gutter ("now", "5m", "2h",
+    /// "3d", "6w"). Falls back to "—" for clock skew or missing data.
+    fn format_history_relative(played_at_unix_secs: u64) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if played_at_unix_secs == 0 || played_at_unix_secs > now {
+            return "—".to_string();
+        }
+        let diff = now - played_at_unix_secs;
+        if diff < 60 {
+            "now".to_string()
+        } else if diff < 3600 {
+            format!("{}m", diff / 60)
+        } else if diff < 86_400 {
+            format!("{}h", diff / 3600)
+        } else if diff < 604_800 {
+            format!("{}d", diff / 86_400)
+        } else {
+            format!("{}w", diff / 604_800)
+        }
+    }
+
+    /// Right-click context menu for an Up Next queue row. Mirrors the
+    /// playlist context menu's backdrop pattern so any outside click
+    /// dismisses it.
+    pub(super) fn render_queue_context_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let menu = self
+            .queue_context_menu
+            .expect("called only when queue context menu is open");
+        let queue_position = menu.queue_position;
+        let track_label = self
+            .queue
+            .get(queue_position)
+            .and_then(|track_ix| self.tracks.get(*track_ix))
+            .map(|track| track.title.clone())
+            .unwrap_or_default();
+        let colors = *self.colors();
+        let queue_len = self.queue.len();
+        let can_move_up = queue_position > 0;
+        let can_move_down = queue_position + 1 < queue_len;
+
+        let mut panel = menu_panel(200.0, colors)
+            .child(menu_header(track_label, colors))
+            .child(self.context_menu_item("Play now").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.queue_context_menu = None;
+                    // Cursor-style: leave the entry in place; just
+                    // move the cursor and play.
+                    this.play_queue_entry(queue_position, cx);
+                    cx.notify();
+                },
+            )));
+
+        if can_move_up {
+            panel = panel.child(self.context_menu_item("Move to top").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.queue_context_menu = None;
+                    this.move_queue_entry(queue_position, 0, cx);
+                },
+            )));
+        }
+        if can_move_down {
+            panel = panel.child(
+                self.context_menu_item("Move to bottom")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.queue_context_menu = None;
+                        let len = this.queue.len();
+                        this.move_queue_entry(queue_position, len, cx);
+                    })),
+            );
+        }
+
+        panel = panel
+            .child(
+                self.context_menu_item("Remove from queue")
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.remove_queue_entry(queue_position, cx);
+                    })),
+            )
+            .child(self.context_menu_item("Clear queue").on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.queue_context_menu = None;
+                    this.clear_queue(cx);
+                },
+            )));
+
+        div()
+            .id("queue-context-menu-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.queue_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.queue_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(menu_at(
+                menu.position,
+                Corner::TopLeft,
+                point(px(2.0), px(2.0)),
+                panel.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                    }),
+                ),
+            ))
+    }
+
+    /// Right-click context menu for a History row.
+    pub(super) fn render_history_context_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let menu = self
+            .history_context_menu
+            .expect("called only when history context menu is open");
+        let history_index = menu.history_index;
+        let colors = *self.colors();
+        let entry = self.playback_history.get(history_index);
+        let title = entry.map(|e| e.title.clone()).unwrap_or_default();
+        let resolved_track_ix = entry.and_then(|e| {
+            self.tracks
+                .iter()
+                .position(|track| track.path == e.track_path)
+        });
+
+        let mut panel = menu_panel(210.0, colors).child(menu_header(title, colors));
+
+        if let Some(track_ix) = resolved_track_ix {
+            panel = panel
+                .child(self.context_menu_item("Play now").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.history_context_menu = None;
+                        if track_ix < this.tracks.len() {
+                            this.play_track(track_ix, cx);
+                        }
+                        cx.notify();
+                    },
+                )))
+                .child(
+                    self.context_menu_item("Add to start of queue")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.history_context_menu = None;
+                            this.queue_track_at_start(track_ix);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    self.context_menu_item("Add to end of queue")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.history_context_menu = None;
+                            this.queue_track_at_end(track_ix);
+                            cx.notify();
+                        })),
+                );
+        }
+
+        panel = panel.child(
+            self.context_menu_item("Remove from history")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.history_context_menu = None;
+                    if history_index < this.playback_history.len() {
+                        this.playback_history.remove(history_index);
+                        this.save_app_state();
+                    }
+                    cx.notify();
+                })),
+        );
+
+        div()
+            .id("history-context-menu-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.history_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.history_context_menu = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(menu_at(
+                menu.position,
+                Corner::TopLeft,
+                point(px(2.0), px(2.0)),
+                panel.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                    }),
+                ),
+            ))
+    }
+
+    /// Dropdown shown when the user clicks the "Up Next ▾" / "History
+    /// ▾" / "<playlist> ▾" header label. Anchored at the click
+    /// position recorded when the dropdown was opened.
+    pub(super) fn render_right_sidebar_view_menu(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let colors = *self.colors();
+        let position = self.right_sidebar_view_menu_position;
+        let active = self.right_sidebar_view;
+
+        let queue_label = if matches!(active, RightSidebarView::Queue) {
+            "Up Next  ✓"
+        } else {
+            "Up Next"
+        };
+        let history_label = if matches!(active, RightSidebarView::History) {
+            "History  ✓"
+        } else {
+            "History"
+        };
+
+        let mut panel = menu_panel(200.0, colors)
+            .child(
+                self.context_menu_item_dynamic(queue_label.to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.right_sidebar_view = RightSidebarView::Queue;
+                        this.right_sidebar_view_menu_open = false;
+                        this.save_app_state();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                self.context_menu_item_dynamic(history_label.to_string())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.right_sidebar_view = RightSidebarView::History;
+                        this.right_sidebar_view_menu_open = false;
+                        this.save_app_state();
+                        cx.notify();
+                    })),
+            );
+
+        // Per-playlist entries grouped under a small section label.
+        if !self.playlists.is_empty() {
+            panel = panel.child(menu_section_label("PLAYLISTS", colors));
+            for (ix, playlist) in self.playlists.iter().enumerate() {
+                let active_mark = if matches!(active, RightSidebarView::Playlist(p) if p == ix) {
+                    "  ✓"
+                } else {
+                    ""
+                };
+                let label = format!("{}{}", playlist.name, active_mark);
+                panel = panel.child(self.context_menu_item_dynamic(label).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.right_sidebar_view = RightSidebarView::Playlist(ix);
+                        this.right_sidebar_view_menu_open = false;
+                        this.right_sidebar_collapsed = false;
+                        this.save_app_state();
+                        cx.notify();
+                    },
+                )));
+            }
+        }
+
+        div()
+            .id("right-sidebar-view-menu-backdrop")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.right_sidebar_view_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.right_sidebar_view_menu_open = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(menu_at(
+                position,
+                Corner::TopLeft,
+                point(px(2.0), px(6.0)),
+                panel.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                    }),
+                ),
+            ))
+    }
+
+    /// Returns the active right-sidebar view, falling back to `Queue`
+    /// when the view points at a playlist index that no longer
+    /// exists. Read-side guard so render code never has to special-
+    /// case a stale `Playlist(ix)` itself.
+    pub(super) fn sanitized_right_sidebar_view(&self) -> RightSidebarView {
+        match self.right_sidebar_view {
+            RightSidebarView::Playlist(ix) if ix >= self.playlists.len() => RightSidebarView::Queue,
+            other => other,
+        }
+    }
+
+    /// Returns true when the active right-sidebar view has rows to
+    /// render. Used by both the sidebar render path (early-return
+    /// when the active view is empty) and the library top-bar's
+    /// reopen-arrow gating (so the arrow only appears when clicking
+    /// it would actually surface content).
+    ///
+    /// Filters the queue against `tracks.len()` to match the same
+    /// stale-index filtering `render_queue` applies, so a queue that
+    /// is non-empty in the raw `Vec` but consists entirely of stale
+    /// indices is correctly considered empty here too.
+    pub(super) fn right_sidebar_active_view_has_content(&self) -> bool {
+        match self.sanitized_right_sidebar_view() {
+            RightSidebarView::Queue => self
+                .queue
+                .iter()
+                .any(|track_ix| *track_ix < self.tracks.len()),
+            RightSidebarView::History => !self.playback_history.is_empty(),
+            RightSidebarView::Playlist(ix) => !self.playlist_track_indices(ix).is_empty(),
+        }
+    }
+
+    /// Resolve a playlist's stored `track_paths` to current
+    /// `self.tracks` indices. Mirrors the resolution logic in
+    /// `source_track_indices` so missing files are silently dropped.
+    pub(super) fn playlist_track_indices(&self, playlist_ix: usize) -> Vec<usize> {
+        let Some(playlist) = self.playlists.get(playlist_ix) else {
+            return Vec::new();
+        };
+        playlist
+            .track_paths
+            .iter()
+            .filter_map(|path| self.tracks.iter().position(|track| &track.path == path))
+            .collect()
+    }
+
+    /// Virtualized list for the right sidebar's playlist view. Mirrors
+    /// `render_history_virtual_list` so a 10k-track playlist is still
+    /// O(viewport) to render.
+    fn render_playlist_virtual_list(
+        &self,
+        track_indices: Vec<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let item_count = track_indices.len();
+        let scroll_handle = self.playlist_sidebar_scroll_handle.clone();
+        let colors = *self.colors();
+
+        div().flex_1().min_h_0().child(
+            uniform_list(
+                "playlist-sidebar-rows",
+                item_count,
+                cx.processor(move |this, range: Range<usize>, _window, cx| {
+                    let _build_span = perf::span(
+                        "playlist_sidebar.uniform_list.build",
+                        format!(
+                            "rows={} range={}..{}",
+                            range.end.saturating_sub(range.start),
+                            range.start,
+                            range.end
+                        ),
+                    );
+                    range
+                        .filter_map(|row_ix| {
+                            let track_ix = track_indices.get(row_ix).copied()?;
+                            let track = this.tracks.get(track_ix)?;
+                            Some(
+                                this.render_playlist_sidebar_row(
+                                    row_ix, track_ix, track, colors, cx,
+                                )
+                                .into_any_element(),
+                            )
+                        })
+                        .collect()
+                }),
+            )
+            .size_full()
+            .track_scroll(scroll_handle),
+        )
+    }
+
+    /// Single row in the right sidebar's playlist view. Click plays
+    /// the track (resetting the queue cursor since the user is
+    /// playing outside the queue); right-click offers the standard
+    /// queue actions.
+    fn render_playlist_sidebar_row(
+        &self,
+        row_ix: usize,
+        track_ix: usize,
+        track: &Track,
+        colors: ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let row_id = SharedString::from(format!("playlist-sidebar-row-{row_ix}"));
+        let active = self.playing_track == track_ix;
+
+        div()
+            .id(row_id)
+            .h(px(41.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .bg(rgb(if active {
+                colors.queue_active
+            } else {
+                colors.queue
+            }))
+            .cursor_pointer()
+            .hover(move |this| this.bg(rgb(colors.queue_active)))
+            .child(
+                div()
+                    .w(px(22.0))
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child(format!("{}", row_ix + 1)),
+            )
+            .child(artwork::album_tile(track, 28.0, colors))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(if active {
+                                colors.accent
+                            } else {
+                                colors.text_strong
+                            }))
+                            .child(track.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(colors.text_muted))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .child(track.artist.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(42.0))
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .child(track.duration.clone()),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if track_ix < this.tracks.len() {
+                    this.play_track(track_ix, cx);
+                    cx.notify();
+                }
+            }))
     }
 }
