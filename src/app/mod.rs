@@ -3794,6 +3794,22 @@ impl Render for TempoApp {
                 MouseButton::Navigate(NavigationDirection::Forward),
                 cx.listener(Self::navigate_forward_mouse),
             )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    if this.close_transient_menus(cx) {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    if this.close_transient_menus(cx) {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if this.drag_volume(event, cx) {
                     cx.stop_propagation();
@@ -3862,9 +3878,6 @@ impl Render for TempoApp {
             .when(self.player.read(cx).settings_output_menu_open(), |this| {
                 this.child(self.settings_output_device_menu(cx))
             })
-            .when(self.player.read(cx).seekbar_menu_open(), |this| {
-                this.child(self.render_seekbar_menu_dismiss_layer(cx))
-            })
             .when_some(self.tooltip.clone(), |this, tooltip| {
                 this.child(self.render_tooltip(&tooltip))
             })
@@ -3872,38 +3885,38 @@ impl Render for TempoApp {
 }
 
 impl TempoApp {
-    fn render_seekbar_menu_dismiss_layer(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        div()
-            .id("seekbar-menu-app-dismiss-layer")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.player.update(cx, |player, player_cx| {
-                        player.close_seekbar_menu();
-                        player_cx.notify();
-                    });
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.player.update(cx, |player, player_cx| {
-                        player.close_seekbar_menu();
-                        player_cx.notify();
-                    });
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
+    fn close_transient_menus(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut closed = false;
+        if self.context_menu_track.take().is_some() {
+            closed = true;
+        }
+        if self.playlist_context_menu.take().is_some() {
+            closed = true;
+        }
+        if self.queue_context_menu.take().is_some() {
+            closed = true;
+        }
+        if self.history_context_menu.take().is_some() {
+            closed = true;
+        }
+        if self.column_menu_open {
+            self.column_menu_open = false;
+            closed = true;
+        }
+        if self.right_sidebar_view_menu_open {
+            self.right_sidebar_view_menu_open = false;
+            closed = true;
+        }
+        if self.player.update(cx, |player, player_cx| {
+            let closed = player.close_seekbar_menu();
+            if closed {
+                player_cx.notify();
+            }
+            closed
+        }) {
+            closed = true;
+        }
+        closed
     }
 
     fn page_label(page: Page) -> &'static str {

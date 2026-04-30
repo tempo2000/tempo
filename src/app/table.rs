@@ -886,6 +886,11 @@ impl TempoApp {
         }
 
         if event.keystroke.key.as_str() == "escape" {
+            if self.close_transient_menus(cx) {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.cancel_table_scrollbar_drag()
                 || self.cancel_table_horizontal_scrollbar_drag()
                 || self.cancel_browse_scrollbar_drag()

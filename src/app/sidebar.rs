@@ -1102,43 +1102,17 @@ impl TempoApp {
                 },
             )));
 
-        // Transparent full-window click-eater behind the anchored menu.
-        // Any mouse-down here dismisses the menu without triggering
-        // whatever is underneath. The menu itself stops propagation on
-        // its own mouse-down so item clicks still work.
-        div()
-            .id("playlist-context-menu-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_mouse_down(
+        menu_at(
+            menu.position,
+            Corner::TopLeft,
+            point(px(2.0), px(2.0)),
+            panel.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.close_playlist_context_menu();
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.notify();
                 }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.close_playlist_context_menu();
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(menu_at(
-                menu.position,
-                Corner::TopLeft,
-                point(px(2.0), px(2.0)),
-                panel.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    }),
-                ),
-            ))
+            ),
+        )
     }
 
     /// Centered modal dialog asking the user to confirm playlist
@@ -1491,39 +1465,17 @@ impl TempoApp {
                 },
             )));
 
-        div()
-            .id("queue-context-menu-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_mouse_down(
+        menu_at(
+            menu.position,
+            Corner::TopLeft,
+            point(px(2.0), px(2.0)),
+            panel.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.queue_context_menu = None;
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.notify();
                 }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.queue_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(menu_at(
-                menu.position,
-                Corner::TopLeft,
-                point(px(2.0), px(2.0)),
-                panel.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    }),
-                ),
-            ))
+            ),
+        )
     }
 
     /// Right-click context menu for a History row.
@@ -1587,39 +1539,17 @@ impl TempoApp {
                 })),
         );
 
-        div()
-            .id("history-context-menu-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_mouse_down(
+        menu_at(
+            menu.position,
+            Corner::TopLeft,
+            point(px(2.0), px(2.0)),
+            panel.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.history_context_menu = None;
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.notify();
                 }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.history_context_menu = None;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(menu_at(
-                menu.position,
-                Corner::TopLeft,
-                point(px(2.0), px(2.0)),
-                panel.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    }),
-                ),
-            ))
+            ),
+        )
     }
 
     /// Dropdown shown when the user clicks the "Up Next ▾" / "History
@@ -1686,39 +1616,17 @@ impl TempoApp {
             }
         }
 
-        div()
-            .id("right-sidebar-view-menu-backdrop")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .on_mouse_down(
+        menu_at(
+            position,
+            Corner::TopLeft,
+            point(px(2.0), px(6.0)),
+            panel.on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.right_sidebar_view_menu_open = false;
+                cx.listener(|_, _: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    cx.notify();
                 }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.right_sidebar_view_menu_open = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                }),
-            )
-            .child(menu_at(
-                position,
-                Corner::TopLeft,
-                point(px(2.0), px(6.0)),
-                panel.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|_, _: &MouseDownEvent, _, cx| {
-                        cx.stop_propagation();
-                    }),
-                ),
-            ))
+            ),
+        )
     }
 
     /// Returns the active right-sidebar view, falling back to `Queue`
