@@ -31,6 +31,7 @@ use std::time::Instant;
 
 mod entity;
 mod render;
+mod visualizers;
 
 pub(super) use entity::{PlayerEntity, PlayerEvent, PlayingTrackSnapshot};
 
@@ -75,6 +76,16 @@ impl TempoApp {
                     return;
                 }
                 self.play_finished_track(cx);
+            }
+            PlayerEvent::PlayThresholdReached { path } => {
+                // The user has now listened to this track for at least
+                // `PLAY_THRESHOLD_SECS`; commit the deferred play
+                // (catalog `play_count`, in-memory mirror, optional
+                // history entry). Sub-threshold skips never reach this
+                // arm, so quickly hopping between tracks leaves no
+                // trace.
+                self.commit_play_for_path(path.as_path());
+                cx.notify();
             }
             PlayerEvent::NowPlayingLinkClicked { kind, path } => {
                 let Some(&track_ix) = self.track_path_index.get(path) else {
@@ -129,6 +140,7 @@ impl TempoApp {
         let player = self.player.read(cx);
         self.volume_snapshot = player.volume();
         self.output_device_snapshot = player.output_device().map(str::to_string);
+        self.seekbar_visualizer_snapshot = player.seekbar_visualizer();
     }
 
     pub(super) fn start_deferred_playback_init(&self, cx: &mut Context<Self>) {
@@ -463,27 +475,24 @@ impl TempoApp {
         });
 
         if result.is_ok() {
-            // Increment play count via catalog (authoritative across
-            // restarts) with an in-memory fallback. Then mirror the
-            // count onto the in-memory `Track` so the table column
-            // reflects it without a query round-trip.
-            let plays = perf::time(
-                "player.increment_play_count",
-                format!("path={}", track_path.display()),
-                || {
-                    self.catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.increment_play_count(&track_path).ok())
-                        .unwrap_or_else(|| self.tracks[track_ix].plays.saturating_add(1))
-                },
-            );
-            if let Some(track) = self.tracks.get_mut(track_ix) {
-                track.plays = plays;
-            }
-            self.rebuild_genres();
-            if record_history {
-                self.record_playback_history(track_ix);
-            }
+            // Recording the play (catalog `play_count`, in-memory
+            // `Track.plays` mirror, JSON history append) is *deferred*
+            // until the user has actually listened for at least
+            // `PLAY_THRESHOLD_SECS`. The player entity's tick emits
+            // `PlayerEvent::PlayThresholdReached { path }` once that
+            // threshold is crossed, and `handle_player_event` calls
+            // `commit_play_for_path` from there. Skipping a track
+            // before the threshold therefore leaves no trace.
+            //
+            // `record_history == false` (the device-switch reload
+            // path) is captured here so the upcoming threshold event
+            // for this same path reuses the original intent rather
+            // than double-counting after `select_output_device`
+            // restarts playback.
+            self.pending_play = Some(PendingPlay {
+                path: track_path.clone(),
+                record_history,
+            });
         }
         perf::log_duration(
             "player.play_track",
@@ -493,6 +502,59 @@ impl TempoApp {
                 track_path.display()
             ),
         );
+    }
+
+    /// Commit a deferred play once the user has listened past
+    /// [`PLAY_THRESHOLD_SECS`]. Increments the catalog `play_count`
+    /// (authoritative across restarts), mirrors the new count onto
+    /// the in-memory `Track` so the table column refreshes without a
+    /// query round-trip, rebuilds the genres index (play counts feed
+    /// "most-played" sorts), and appends a `PlaybackHistoryEntry`
+    /// when `record_history` was set on the pending play.
+    ///
+    /// Called from the `PlayerEvent::PlayThresholdReached` arm of
+    /// `handle_player_event`. The `path` arg is the path the player
+    /// crossed 15 s on; we resolve to a track index here (rather than
+    /// trusting `self.playing_track`) so a quick skip+restart can't
+    /// commit a play against the wrong row.
+    pub(super) fn commit_play_for_path(&mut self, path: &std::path::Path) {
+        let Some(pending) = self.pending_play.take() else {
+            return;
+        };
+        if pending.path != path {
+            // Stale event for a track that was skipped before crossing
+            // the threshold. Drop it; the new track's pending entry
+            // (if any) is already in place.
+            return;
+        }
+        let Some(&track_ix) = self.track_path_index.get(&pending.path) else {
+            // Track was removed from the library between play and
+            // commit (very rare — would need a rescan mid-playback).
+            return;
+        };
+
+        let plays = perf::time(
+            "player.increment_play_count",
+            format!("path={}", pending.path.display()),
+            || {
+                self.catalog
+                    .as_ref()
+                    .and_then(|catalog| catalog.increment_play_count(&pending.path).ok())
+                    .unwrap_or_else(|| {
+                        self.tracks
+                            .get(track_ix)
+                            .map(|track| track.plays.saturating_add(1))
+                            .unwrap_or(1)
+                    })
+            },
+        );
+        if let Some(track) = self.tracks.get_mut(track_ix) {
+            track.plays = plays;
+        }
+        self.rebuild_genres();
+        if pending.record_history {
+            self.record_playback_history(track_ix);
+        }
     }
 
     /// Smart play/pause: if currently playing, pause; if paused but

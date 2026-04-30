@@ -615,7 +615,13 @@ impl TempoApp {
                 .unwrap_or(true),
         };
 
-        if collapsed || nothing_to_show || active_view_empty {
+        // Only collapse the sidebar entirely when the user explicitly
+        // closed it, or when there is genuinely nothing across any
+        // view to switch to. An empty *active* view should still show
+        // the sidebar chrome with an empty-state message — silently
+        // closing the sidebar after the user picks "Up Next" while
+        // the queue is empty made it look like the click was a no-op.
+        if collapsed || nothing_to_show {
             return div().w(px(0.0)).flex_none().into_any_element();
         }
 
@@ -631,16 +637,23 @@ impl TempoApp {
             ),
         };
 
-        let body: AnyElement = match view {
-            RightSidebarView::Queue => self
-                .render_queue_virtual_list(queue_indices, cx)
-                .into_any_element(),
-            RightSidebarView::History => self
-                .render_history_virtual_list(history_indices, cx)
-                .into_any_element(),
-            RightSidebarView::Playlist(_) => self
-                .render_playlist_virtual_list(playlist_track_ix_for_view.unwrap_or_default(), cx)
-                .into_any_element(),
+        let body: AnyElement = if active_view_empty {
+            self.render_right_sidebar_empty_state(view, cx)
+        } else {
+            match view {
+                RightSidebarView::Queue => self
+                    .render_queue_virtual_list(queue_indices, cx)
+                    .into_any_element(),
+                RightSidebarView::History => self
+                    .render_history_virtual_list(history_indices, cx)
+                    .into_any_element(),
+                RightSidebarView::Playlist(_) => self
+                    .render_playlist_virtual_list(
+                        playlist_track_ix_for_view.unwrap_or_default(),
+                        cx,
+                    )
+                    .into_any_element(),
+            }
         };
 
         div()
@@ -802,6 +815,57 @@ impl TempoApp {
             .size_full()
             .track_scroll(scroll_handle),
         )
+    }
+
+    /// Empty-state body rendered when the active right-sidebar view
+    /// has no rows. Keeps the sidebar chrome (header + view picker)
+    /// visible so the user can switch to a populated view rather than
+    /// having the whole panel disappear out from under them.
+    fn render_right_sidebar_empty_state(
+        &self,
+        view: RightSidebarView,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = *self.colors();
+        let (title, hint) = match view {
+            RightSidebarView::Queue => (
+                "Up Next is empty",
+                "Right-click a track and choose \"Add to queue\" to line up plays.",
+            ),
+            RightSidebarView::History => (
+                "No plays yet",
+                "Tracks you listen to for at least 15 seconds show up here.",
+            ),
+            RightSidebarView::Playlist(_) => (
+                "Playlist is empty",
+                "Drop tracks into this playlist from the table or right-click menu.",
+            ),
+        };
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .px_4()
+            .gap_2()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(colors.text_muted))
+                    .child(title),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(colors.text_faint))
+                    .text_center()
+                    .child(hint),
+            )
+            .into_any_element()
     }
 
     /// Header label that doubles as a click target to toggle the
@@ -1239,8 +1303,15 @@ impl TempoApp {
                     .hover(move |this| this.bg(rgb(colors.queue_active)))
             })
             .child(
+                // Fixed-width relative-time gutter ("now", "5m", "23h",
+                // "364d"). `flex_none` + `overflow_hidden` keep
+                // 3-character labels on a single line — without these
+                // the parent flex squeezed the column and "25m" wrapped
+                // to two lines.
                 div()
-                    .w(px(22.0))
+                    .w(px(28.0))
+                    .flex_none()
+                    .overflow_hidden()
                     .text_xs()
                     .text_color(rgb(colors.text_faint))
                     .child(Self::format_history_relative(entry.played_at_unix_secs)),

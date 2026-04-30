@@ -68,6 +68,13 @@
 use super::*;
 use std::time::Instant;
 
+/// Minimum playback position (in seconds) that must be reached before
+/// a track counts as "played" — incrementing the catalog play_count
+/// and being appended to the playback history. Skipping a track
+/// before this threshold leaves no trace, so quickly hopping between
+/// tracks while browsing doesn't litter history.
+pub(crate) const PLAY_THRESHOLD_SECS: u64 = 15;
+
 /// Events emitted by [`PlayerEntity`] for the parent to react to.
 ///
 /// All variants are `Clone` so a single subscriber can fan them out to
@@ -108,6 +115,15 @@ pub(crate) enum PlayerEvent {
     /// Carries the *finished* path so the parent can disambiguate from
     /// any stop/seek it issued itself.
     TrackFinished { finished_path: PathBuf },
+
+    /// The currently-playing track has been listened to for at least
+    /// [`PLAY_THRESHOLD_SECS`] seconds (measured by playback position,
+    /// not wall clock — pauses don't count, but a seek past the
+    /// threshold does). Emitted exactly once per `start_playback`
+    /// call. The parent uses this to commit the play to history and
+    /// the catalog `play_count`, so quickly skipping between tracks
+    /// (under 15 s) doesn't litter the history.
+    PlayThresholdReached { path: PathBuf },
 
     /// State that should be persisted has changed (volume committed
     /// after drag, output device chosen, playback mode cycled, etc.).
@@ -175,6 +191,14 @@ pub(crate) struct PlayerEntity {
     pub(super) playing_track_path: Option<PathBuf>,
     pub(super) is_playing: bool,
     pub(super) playback_mode: PlaybackMode,
+    /// `true` once the current playback has crossed
+    /// [`PLAY_THRESHOLD_SECS`] of position and emitted
+    /// [`PlayerEvent::PlayThresholdReached`]. Reset to `false` at the
+    /// start of every `start_playback` call (and by stop / library
+    /// reload) so each fresh play has to earn its history entry. The
+    /// playback heartbeat tick reads this flag to fire the event at
+    /// most once per play.
+    pub(super) play_threshold_reached: bool,
 
     // === Volume slider ===
     pub(super) volume: f32,
@@ -195,6 +219,40 @@ pub(crate) struct PlayerEntity {
     /// after a window resize, since the seekbar's `flex_1` width is
     /// the only piece of the bar that grows with the viewport.
     pub(super) waveform_seekbar_scroll_handle: gpui::ScrollHandle,
+    pub(super) seekbar_menu_open: bool,
+    /// Click position recorded when the ✦ menu was opened. The
+    /// menu floats via [`super::super::menu::menu_at`] anchored at
+    /// this point so it draws above the rest of the app
+    /// (table/grid views included). Without an anchored overlay the
+    /// menu would render as a child of the seekbar surface and get
+    /// clipped/z-ordered behind the page content above.
+    pub(super) seekbar_menu_position: Point<Pixels>,
+    pub(super) seekbar_fps_enabled: bool,
+    pub(super) seekbar_fps_last_frame: Option<Instant>,
+    pub(super) seekbar_fps_smoothed: f32,
+    /// Pointer hover over the seekbar. Used by frequency-reactive
+    /// visualizers to fade the precomputed-peaks waveform in over
+    /// the live visualization, so the user can see roughly where a
+    /// click will seek to. `Waveform` mode ignores this.
+    pub(super) seekbar_hovered: bool,
+    /// Eased `[0.0, 1.0]` overlay intensity for the hover-revealed
+    /// waveform. Updated each frame by [`Self::sample_seekbar_hover_intensity`]
+    /// from `seekbar_hovered`; the easing makes the fade in/out feel
+    /// physical rather than snapping.
+    pub(super) seekbar_hover_intensity: f32,
+    /// Wall clock at the previous hover-intensity sample. `None`
+    /// means no prior frame; the next sample will pin to the target.
+    pub(super) seekbar_hover_last_sampled: Option<Instant>,
+    /// Which visualizer draws inside the seekbar surface. Persisted in
+    /// `state.json`. `Waveform` is the original behaviour and the only
+    /// variant that doesn't depend on the live audio analyzer.
+    pub(super) seekbar_visualizer: VisualizerKind,
+    /// Smoothed per-band magnitudes carried across frames so the
+    /// frequency-reactive visualizers can ease toward each new
+    /// analyzer frame instead of snapping. The entity owns this so
+    /// the smoothing survives across `Render` calls; visualizers
+    /// borrow it mutably from the [`super::visualizers::VisualizerContext`].
+    pub(super) band_smoothed: [f32; tempo::audio_analyzer::BAND_COUNT],
 
     // === Output device picker ===
     /// Saved/preferred output device name, persisted to app state.
@@ -393,6 +451,7 @@ impl PlayerEntity {
     pub(crate) fn new(
         initial_volume: f32,
         initial_output_device: Option<String>,
+        initial_visualizer: VisualizerKind,
         catalog: Option<CatalogStore>,
         theme_colors: ThemeColors,
         _cx: &mut Context<Self>,
@@ -404,11 +463,22 @@ impl PlayerEntity {
             playing_track_path: None,
             is_playing: false,
             playback_mode: PlaybackMode::Straight,
+            play_threshold_reached: false,
             volume,
             pre_mute_volume: if volume > 0.0 { volume } else { 1.0 },
             volume_dragging: false,
             volume_bar_scroll_handle: gpui::ScrollHandle::new(),
             waveform_seekbar_scroll_handle: gpui::ScrollHandle::new(),
+            seekbar_menu_open: false,
+            seekbar_menu_position: Point::default(),
+            seekbar_fps_enabled: false,
+            seekbar_fps_last_frame: None,
+            seekbar_fps_smoothed: 0.0,
+            seekbar_hovered: false,
+            seekbar_hover_intensity: 0.0,
+            seekbar_hover_last_sampled: None,
+            seekbar_visualizer: initial_visualizer,
+            band_smoothed: [0.0; tempo::audio_analyzer::BAND_COUNT],
             output_device: initial_output_device,
             output_menu_source: None,
             output_menu_position: Point::default(),
@@ -533,6 +603,26 @@ impl PlayerEntity {
                             .as_ref()
                             .map(|playback| playback.position().as_secs() as i64)
                             .unwrap_or(0);
+
+                        // Fire `PlayThresholdReached` exactly once per
+                        // play, the first tick on which the playback
+                        // position has advanced past 15 s. The flag is
+                        // reset by `start_playback` / `stop` /
+                        // `reset_for_library_reload`, so each fresh
+                        // play has to earn its history entry. Using
+                        // playback position (not wall clock) means
+                        // pauses don't count toward the threshold but
+                        // a deliberate forward seek does — both match
+                        // the user-facing definition of "I listened to
+                        // 15 seconds of this track".
+                        if !player.play_threshold_reached
+                            && current_seconds >= PLAY_THRESHOLD_SECS as i64
+                            && let Some(path) = player.playing_track_path.clone()
+                        {
+                            player.play_threshold_reached = true;
+                            cx.emit(PlayerEvent::PlayThresholdReached { path });
+                        }
+
                         if current_seconds != last_emitted_seconds {
                             last_emitted_seconds = current_seconds;
                             cx.notify();
@@ -572,6 +662,7 @@ impl PlayerEntity {
         let had_track = self.playing_track_path.is_some();
         self.is_playing = false;
         self.playing_track_path = None;
+        self.play_threshold_reached = false;
         self.waveform_cache.clear();
         self.waveform_loading.clear();
         self.waveform_displayed_source = None;
@@ -713,6 +804,12 @@ impl PlayerEntity {
         let prior_path = self.playing_track_path.as_deref().map(PathBuf::from);
 
         self.playing_track_path = Some(path.clone());
+        // Each fresh play must earn its history entry: clear the
+        // threshold flag so the tick will re-fire
+        // `PlayThresholdReached` once this new playback crosses 15 s.
+        // This applies even when re-playing the same path (loop, manual
+        // restart) — replays are intentional and should each count once.
+        self.play_threshold_reached = false;
 
         let Some(playback) = &self.playback else {
             self.is_playing = false;
@@ -1088,6 +1185,114 @@ impl PlayerEntity {
     pub(crate) fn set_now_playing_info_hovered(&mut self, hovered: bool, alt: bool) {
         self.now_playing_info_hovered = hovered;
         self.alt_pressed = alt;
+    }
+
+    pub(crate) fn toggle_seekbar_menu(&mut self, position: Point<Pixels>) {
+        self.seekbar_menu_position = position;
+        self.seekbar_menu_open = !self.seekbar_menu_open;
+    }
+
+    /// Pointer hover state setter for the seekbar surface. Returns
+    /// true if the value changed -- the caller can skip a `notify`
+    /// when the state is already correct (hover events fire on every
+    /// frame the pointer is inside the bounds).
+    pub(crate) fn set_seekbar_hovered(&mut self, hovered: bool) -> bool {
+        if self.seekbar_hovered == hovered {
+            return false;
+        }
+        self.seekbar_hovered = hovered;
+        true
+    }
+
+    /// Advance and read the hover-fade intensity. Eases toward
+    /// `seekbar_hovered ? 1.0 : 0.0` with a fixed time constant so
+    /// the fade looks the same at any frame rate. Returns the eased
+    /// value in `[0.0, 1.0]`. The render path is responsible for
+    /// requesting another animation frame while this value is in
+    /// transit (i.e. not equal to the target) so the easing actually
+    /// progresses; a polled-only sampler would freeze mid-fade as
+    /// soon as the steady-state animation gates close.
+    pub(crate) fn sample_seekbar_hover_intensity(&mut self) -> f32 {
+        let target: f32 = if self.seekbar_hovered { 1.0 } else { 0.0 };
+        let now = Instant::now();
+        let Some(previous) = self.seekbar_hover_last_sampled.replace(now) else {
+            // First sample after a reset / startup: snap to target so
+            // we don't see a fade-from-zero on the very first paint.
+            self.seekbar_hover_intensity = target;
+            return target;
+        };
+        let dt = now.duration_since(previous).as_secs_f32().min(0.1);
+        // Time constant for the exponential ease. ~120 ms feels
+        // responsive without being abrupt; matches what the OS uses
+        // for tooltip fade.
+        const TAU_SECS: f32 = 0.12;
+        let alpha = 1.0 - (-dt / TAU_SECS).exp();
+        self.seekbar_hover_intensity += (target - self.seekbar_hover_intensity) * alpha;
+        // Snap when we're within a sub-pixel of the target so the
+        // animation system can stop requesting frames.
+        if (self.seekbar_hover_intensity - target).abs() < 0.005 {
+            self.seekbar_hover_intensity = target;
+        }
+        self.seekbar_hover_intensity
+    }
+
+    pub(crate) fn toggle_seekbar_fps(&mut self) {
+        self.seekbar_fps_enabled = !self.seekbar_fps_enabled;
+        self.seekbar_fps_last_frame = None;
+        self.seekbar_fps_smoothed = 0.0;
+    }
+
+    /// Currently selected seekbar visualizer.
+    pub(crate) fn seekbar_visualizer(&self) -> VisualizerKind {
+        self.seekbar_visualizer
+    }
+
+    /// Pick a visualizer. Emits [`PlayerEvent::StateMutated`] so the
+    /// parent persists the choice. Resets the smoothed-band state so
+    /// switching mid-track doesn't carry over momentum from the
+    /// previous visualizer.
+    pub(crate) fn set_seekbar_visualizer(&mut self, kind: VisualizerKind, cx: &mut Context<Self>) {
+        if self.seekbar_visualizer == kind {
+            return;
+        }
+        self.seekbar_visualizer = kind;
+        self.band_smoothed = [0.0; tempo::audio_analyzer::BAND_COUNT];
+        cx.emit(PlayerEvent::StateMutated);
+        cx.notify();
+    }
+
+    /// Borrow a clone of the live audio analyzer, if the playback
+    /// backend is up. Renderers call this on every paint when a
+    /// frequency-reactive visualizer is active.
+    pub(crate) fn audio_analyzer(&self) -> Option<tempo::audio_analyzer::AudioAnalyzer> {
+        self.playback.as_ref().map(|p| p.analyzer())
+    }
+
+    pub(crate) fn sample_seekbar_fps(&mut self) -> f32 {
+        let now = Instant::now();
+        let Some(previous) = self.seekbar_fps_last_frame.replace(now) else {
+            return self.seekbar_fps_smoothed;
+        };
+
+        let delta = now.duration_since(previous).as_secs_f32();
+        if delta <= 0.0 {
+            return self.seekbar_fps_smoothed;
+        }
+
+        // Ignore long gaps from toggling the overlay, tab stalls, or
+        // debugger/build pauses. Those are not steady-state frame rate
+        // and otherwise make the smoothed counter look stuck near 7 FPS.
+        if delta > 0.25 {
+            return self.seekbar_fps_smoothed;
+        }
+
+        let instant_fps = (1.0 / delta).clamp(0.0, 240.0);
+        self.seekbar_fps_smoothed = if self.seekbar_fps_smoothed <= 0.0 {
+            instant_fps
+        } else {
+            self.seekbar_fps_smoothed * 0.85 + instant_fps * 0.15
+        };
+        self.seekbar_fps_smoothed
     }
 
     /// Currently unused — `PlayerEntity::render` reads

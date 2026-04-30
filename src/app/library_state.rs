@@ -197,6 +197,7 @@ impl TempoApp {
             // already in its post-migration form.
             liked_column_migrated: true,
             right_sidebar_view: self.right_sidebar_view,
+            seekbar_visualizer: self.seekbar_visualizer_snapshot,
         }
     }
 
@@ -297,6 +298,12 @@ impl TempoApp {
 
         self.player
             .update(cx, |player, cx| player.reset_for_library_reload(cx));
+        // Library reload mirrors the player's reset: drop any
+        // deferred play awaiting the 15 s threshold. The track may
+        // not even exist anymore once the rescan completes, and the
+        // player won't be re-emitting `PlayThresholdReached` for the
+        // pre-reload path either way.
+        self.pending_play = None;
         self.library_root_label = Self::library_root_label(&self.library_roots);
         self.tracks = perf::time(
             "library.restart_watcher.load_cached_tracks",

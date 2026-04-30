@@ -141,6 +141,41 @@ enum PlaybackMode {
     Shuffle,
 }
 
+/// Which visualizer renders inside the seekbar surface.
+///
+/// `Waveform` is the precomputed-peaks bar chart that has always lived
+/// in the seekbar. The other variants render frequency-reactive views
+/// driven by [`crate::audio_analyzer::AudioAnalyzer`]. The user picks
+/// one from the ✦ menu on the seekbar; the choice is persisted in
+/// `state.json` so it survives restarts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub(crate) enum VisualizerKind {
+    /// Original cached-peaks waveform with a progressive playhead.
+    /// Default for new users; the only visualizer that doesn't need a
+    /// live audio tap.
+    #[default]
+    Waveform,
+    /// Curve drawn through 32 points spaced along log frequency, each
+    /// point's height tied to that band's magnitude. Reads as an
+    /// oscilloscope-style "spectrum line" that dances with the audio.
+    DancingLine,
+    /// Vertical bars across log-spaced frequency bands. Classic
+    /// spectrum-analyzer look.
+    FrequencyBars,
+}
+
+impl VisualizerKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Waveform => "Waveform",
+            Self::DancingLine => "Dancing Line",
+            Self::FrequencyBars => "Frequency Bars",
+        }
+    }
+
+    pub(crate) const ALL: [Self; 3] = [Self::Waveform, Self::DancingLine, Self::FrequencyBars];
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum OnlineMetadataMode {
     Off,
@@ -774,6 +809,33 @@ struct PlaybackHistoryEntry {
     duration: String,
 }
 
+/// Transient bookkeeping for a play that has *started* but hasn't yet
+/// crossed the [`crate::app::player::entity::PLAY_THRESHOLD_SECS`]
+/// listening threshold. Stored on `TempoApp` until the player entity
+/// emits [`crate::app::player::entity::PlayerEvent::PlayThresholdReached`],
+/// at which point `commit_play_for_path` consumes it to write the
+/// catalog `play_count` increment and (when `record_history` is
+/// `true`) the `PlaybackHistoryEntry`.
+///
+/// Replaced wholesale on every `play_track_with_history` call: a
+/// pending entry that never reaches the threshold is silently
+/// discarded when the next play overwrites it, which is exactly the
+/// "don't litter history when scrubbing through tracks" behavior we
+/// want.
+///
+/// Not persisted — a deferred play that hadn't crossed the threshold
+/// at quit time is effectively a "didn't really play it" and should
+/// not survive a restart.
+#[derive(Clone)]
+struct PendingPlay {
+    path: PathBuf,
+    /// Mirrors the `record_history` arg passed into
+    /// `play_track_with_history`. `false` for the device-switch
+    /// reload path so picking a new output device doesn't double-
+    /// count the in-progress play.
+    record_history: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum TabSource {
     Library,
@@ -1045,6 +1107,11 @@ struct AppState {
     /// field in their saved state.
     #[serde(default)]
     right_sidebar_view: RightSidebarView,
+    /// Persisted seekbar visualizer choice. Defaults to `Waveform`
+    /// (the original behaviour) for users who didn't have this field
+    /// in their saved state.
+    #[serde(default)]
+    seekbar_visualizer: VisualizerKind,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1102,6 +1169,7 @@ impl Default for AppState {
             // re-run it spuriously on the second launch.
             liked_column_migrated: true,
             right_sidebar_view: RightSidebarView::default(),
+            seekbar_visualizer: VisualizerKind::default(),
         }
     }
 }
@@ -1559,6 +1627,15 @@ pub(crate) struct TempoApp {
     library_roots: Vec<PathBuf>,
     playlists: Vec<Playlist>,
     playback_history: Vec<PlaybackHistoryEntry>,
+    /// In-flight deferred play awaiting the 15 s listening threshold.
+    /// `Some` from the moment `play_track_with_history` succeeds until
+    /// the player emits `PlayThresholdReached` (which calls
+    /// `commit_play_for_path` to consume it) or until the next
+    /// `play_track_with_history` overwrites it (which is how
+    /// quick-skip discards a sub-threshold play). Cleared on stop /
+    /// library reload paths via `reset_pending_play`. Not persisted
+    /// across app restarts — see [`PendingPlay`] docs.
+    pending_play: Option<PendingPlay>,
     theme_id: String,
     themes: Vec<Theme>,
     library_root_label: String,
@@ -1635,6 +1712,12 @@ pub(crate) struct TempoApp {
     /// Denormalized mirror of `self.player.read(cx).output_device()`,
     /// for the same reason as `volume_snapshot`.
     output_device_snapshot: Option<String>,
+    /// Denormalized mirror of `self.player.read(cx).seekbar_visualizer()`.
+    /// Same rationale as `volume_snapshot`: the player owns the
+    /// authoritative choice and emits [`PlayerEvent::StateMutated`]
+    /// after the user picks one; this field is read by `app_state`
+    /// (the serializer) without needing `cx`.
+    seekbar_visualizer_snapshot: VisualizerKind,
     /// Held subscription that forwards [`player::PlayerEvent`]s into
     /// `TempoApp::handle_player_event`. Dropping this subscription
     /// would silently break cross-region updates (e.g. table active
@@ -1736,6 +1819,7 @@ impl TempoApp {
             player::PlayerEntity::new(
                 volume,
                 state.output_device.clone(),
+                state.seekbar_visualizer,
                 catalog.clone(),
                 initial_theme_colors,
                 player_cx,
@@ -1933,6 +2017,7 @@ impl TempoApp {
             table_scroll_generation: 0,
             catalog,
             playback_history: state.playback_history,
+            pending_play: None,
             _library_watcher: library_watcher,
             metadata_event_tx,
             metadata_demand_queue,
@@ -1941,6 +2026,7 @@ impl TempoApp {
             player,
             volume_snapshot: volume,
             output_device_snapshot: state.output_device.clone(),
+            seekbar_visualizer_snapshot: state.seekbar_visualizer,
             _player_subscription: player_subscription,
             _save_on_quit: Some(save_on_quit),
         };
