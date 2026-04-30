@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use cpal::{Device, traits::DeviceTrait as _, traits::HostTrait as _};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 
+use crate::audio_analyzer::AudioAnalyzer;
 use crate::perf;
 
 #[derive(Clone, Debug)]
@@ -18,6 +19,13 @@ pub struct PlaybackController {
     /// without blocking the UI on file open + `Decoder::try_from`.
     player: Arc<Player>,
     output_name: String,
+    /// Live audio analyzer fed by a [`TapSource`] inserted between the
+    /// decoder and the rodio sink. Cloned into the renderer for
+    /// frequency-reactive visualizers (dancing line, bars, mini
+    /// spectrogram). Surviving across `set_output` and `play_path` so
+    /// the renderer's handle stays valid; only the *contents* of the
+    /// ring buffer are reset on track change.
+    analyzer: AudioAnalyzer,
 }
 
 impl PlaybackController {
@@ -34,7 +42,15 @@ impl PlaybackController {
             _device: device,
             player,
             output_name,
+            analyzer: AudioAnalyzer::new(),
         })
+    }
+
+    /// Handle to the live audio analyzer. Cheap to clone (`Arc`); the
+    /// renderer keeps one and polls [`AudioAnalyzer::latest_frame`] on
+    /// each repaint when a frequency-reactive visualizer is active.
+    pub fn analyzer(&self) -> AudioAnalyzer {
+        self.analyzer.clone()
     }
 
     pub fn output_devices() -> Vec<PlaybackOutputDevice> {
@@ -70,6 +86,9 @@ impl PlaybackController {
         player.set_volume(volume);
 
         self.player.stop();
+        // Clear visualizer history; the new device will start writing
+        // fresh samples once playback resumes.
+        self.analyzer.reset();
         self._device = device;
         self.player = player;
         self.output_name = output_name;
@@ -128,8 +147,13 @@ impl PlaybackController {
         // we return to the caller; the *next* source's decode work
         // happens off-thread.
         self.player.stop();
+        // Clear the analyzer's ring buffer so visualizers don't briefly
+        // display the *previous* track's tail while the new decoder
+        // spins up.
+        self.analyzer.reset();
 
         let player = Arc::clone(&self.player);
+        let analyzer = self.analyzer.clone();
         let path: PathBuf = path.to_path_buf();
         thread::Builder::new()
             .name("tempo-decode".into())
@@ -155,7 +179,10 @@ impl PlaybackController {
                         return;
                     }
                 };
-                player.append(source);
+                // `tap` wraps the decoder in a transparent `Source`
+                // that copies samples into the analyzer's ring buffer
+                // before they reach the mixer. No audio path change.
+                player.append(analyzer.tap(source));
                 player.play();
             })
             .context("failed to spawn audio decode thread")?;

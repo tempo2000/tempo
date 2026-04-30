@@ -1,3 +1,4 @@
+pub mod audio_analyzer;
 pub mod catalog;
 pub mod library;
 pub mod metadata_worker;
