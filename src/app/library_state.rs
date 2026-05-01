@@ -207,6 +207,16 @@ impl TempoApp {
             eq_gains_db: self.eq_state.gains_db(),
             eq_active_profile: self.eq_active_profile.clone(),
             eq_profiles: self.eq_profiles.clone(),
+            global_hotkeys: self
+                .hotkey_service
+                .as_ref()
+                .map(|svc| {
+                    svc.snapshot()
+                        .into_iter()
+                        .map(|(action, combo)| (action.storage_key().to_string(), combo))
+                        .collect()
+                })
+                .unwrap_or_default(),
         }
     }
 

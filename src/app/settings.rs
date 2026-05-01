@@ -120,6 +120,9 @@ impl TempoApp {
                                 SettingsSection::OnlineMetadata => {
                                     self.render_online_metadata_settings(cx).into_any_element()
                                 }
+                                SettingsSection::Hotkeys => {
+                                    super::hotkeys_panel::render_hotkey_section(self, cx)
+                                }
                             }),
                     ),
             )
@@ -273,6 +276,16 @@ impl TempoApp {
                 r#"<circle cx="12" cy="12" r="7.6" fill="none" stroke="{color}" stroke-width="1.6"/>
 <path d="M4.4 12H19.6" fill="none" stroke="{color}" stroke-width="1.5"/>
 <path d="M12 4.4C14.2 6.5 15.4 9.2 15.4 12C15.4 14.8 14.2 17.5 12 19.6C9.8 17.5 8.6 14.8 8.6 12C8.6 9.2 9.8 6.5 12 4.4Z" fill="none" stroke="{accent_stroke}" stroke-width="1.5" stroke-linejoin="round"/>"#
+            ),
+            // Keyboard — global hotkeys.
+            SettingsSection::Hotkeys => format!(
+                r#"<rect x="3" y="6.5" width="18" height="11" rx="1.6" fill="none" stroke="{color}" stroke-width="1.6"/>
+<rect x="5.6" y="9" width="1.6" height="1.6" fill="{color}"/>
+<rect x="8.4" y="9" width="1.6" height="1.6" fill="{accent_stroke}"/>
+<rect x="11.2" y="9" width="1.6" height="1.6" fill="{color}"/>
+<rect x="14.0" y="9" width="1.6" height="1.6" fill="{color}"/>
+<rect x="16.8" y="9" width="1.6" height="1.6" fill="{accent_stroke}"/>
+<rect x="7.5" y="13.6" width="9" height="1.6" fill="{accent_stroke}"/>"#
             ),
         };
 

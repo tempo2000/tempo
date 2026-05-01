@@ -60,6 +60,11 @@ impl TempoApp {
                 if matches!(self.window_mode, WindowMode::Mini(_)) {
                     self.pending_window_title = Some(self.format_window_title());
                 }
+                // Push fresh metadata to MPRIS so taskbar widgets
+                // ("Now Playing"), KDE Connect, and the lock screen
+                // re-render with the new track.
+                let meta = self.mpris_current_metadata();
+                self.mpris_publish(tempo::mpris::MprisUpdate::Metadata(meta));
                 cx.notify();
             }
             PlayerEvent::IsPlayingChanged(is_playing) => {
@@ -69,6 +74,15 @@ impl TempoApp {
                     "player.is_playing_changed",
                     format!("is_playing={is_playing}"),
                 );
+                // Mirror the play/pause state to MPRIS.
+                let status = if *is_playing {
+                    tempo::mpris::MprisPlaybackStatus::Playing
+                } else if self.tracks.is_empty() {
+                    tempo::mpris::MprisPlaybackStatus::Stopped
+                } else {
+                    tempo::mpris::MprisPlaybackStatus::Paused
+                };
+                self.mpris_publish(tempo::mpris::MprisUpdate::PlaybackStatus(status));
                 cx.notify();
             }
             PlayerEvent::TrackFinished { finished_path } => {
@@ -110,6 +124,11 @@ impl TempoApp {
             PlayerEvent::StateMutated => {
                 self.refresh_player_state_snapshot(cx);
                 self.save_app_state();
+                // Volume / mute changes funnel through here; mirror
+                // the resulting volume to MPRIS.
+                self.mpris_publish(tempo::mpris::MprisUpdate::Volume(
+                    self.volume_snapshot as f64,
+                ));
             }
             PlayerEvent::RequestPlayPause => {
                 self.toggle_playback(cx);
@@ -753,10 +772,10 @@ impl TempoApp {
         }
     }
 
-    /// Programmatic volume change — currently unused by UI (the volume
-    /// bar drives the player directly), but exposed for future
-    /// media-key / DBus integration.
-    #[allow(dead_code)]
+    /// Programmatic volume change. Used by the global-hotkey dispatcher
+    /// (`VolumeUp` / `VolumeDown` actions) and any future media-key /
+    /// DBus integration. The volume bar in the player drives the player
+    /// directly, so this method is for non-UI callers only.
     pub(super) fn set_playback_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
         self.player
             .update(cx, |player, cx| player.set_volume(volume, cx));
@@ -908,9 +927,10 @@ impl TempoApp {
     /// current track first. Lives on `TempoApp` because the restart
     /// case needs the track index → path resolution.
     ///
-    /// Currently exposed for media-key / scrubber integrations; the
-    /// in-app waveform click goes through `seek_from_waveform_click`.
-    #[allow(dead_code)]
+    /// Used by the global-hotkey dispatcher (`SeekForward` /
+    /// `SeekBackward` actions) and any future media-key / DBus
+    /// integration. The in-app waveform click goes through
+    /// `seek_from_waveform_click` instead.
     pub(super) fn seek_playback(&mut self, position: Duration, cx: &mut Context<Self>) {
         let needs_restart = self.player.update(cx, |player, cx| {
             // Check before calling seek so we don't burn the seek

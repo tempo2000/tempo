@@ -40,6 +40,7 @@ mod browse_grids;
 mod charts;
 mod equalizer_panel;
 mod history;
+mod hotkeys_panel;
 mod library_state;
 mod library_view;
 mod liked;
@@ -174,6 +175,7 @@ pub(super) enum SettingsSection {
     AudioOutput,
     Library,
     OnlineMetadata,
+    Hotkeys,
 }
 
 impl SettingsSection {
@@ -183,15 +185,17 @@ impl SettingsSection {
             Self::AudioOutput => "Audio Output",
             Self::Library => "Library",
             Self::OnlineMetadata => "Online Metadata",
+            Self::Hotkeys => "Hotkeys",
         }
     }
 
-    pub(super) fn all() -> [Self; 4] {
+    pub(super) fn all() -> [Self; 5] {
         [
             Self::Appearance,
             Self::AudioOutput,
             Self::Library,
             Self::OnlineMetadata,
+            Self::Hotkeys,
         ]
     }
 }
@@ -1457,6 +1461,11 @@ struct AppState {
     /// here — they're embedded in code and referenced by name.
     #[serde(default)]
     eq_profiles: Vec<tempo::equalizer::EqProfile>,
+    /// User-bound global hotkeys, keyed by `HotkeyAction::storage_key()`.
+    /// Empty for new users (they record their own combos in
+    /// Settings → Hotkeys); preserved across versions.
+    #[serde(default)]
+    global_hotkeys: HashMap<String, tempo::hotkeys::KeyCombo>,
 }
 
 fn default_eq_gains() -> [f32; tempo::equalizer::BAND_COUNT] {
@@ -1528,6 +1537,7 @@ impl Default for AppState {
             eq_gains_db: default_eq_gains(),
             eq_active_profile: None,
             eq_profiles: Vec::new(),
+            global_hotkeys: HashMap::new(),
         }
     }
 }
@@ -2162,6 +2172,27 @@ pub(crate) struct TempoApp {
     /// current track in mini mode so the system task switcher /
     /// taskbar shows useful info).
     pending_window_title: Option<String>,
+
+    // === Global hotkeys (evdev) ===
+    /// Background watcher reading `/dev/input/event*`. `None` if we
+    /// failed to spawn the device threads (uncommon -- the service
+    /// itself is constructed even when no devices were openable; the
+    /// `init_status` field tells us whether any keyboards are being
+    /// listened to). Kept alive for the app's lifetime; dropping it
+    /// signals the watcher threads to exit.
+    pub(super) hotkey_service: Option<tempo::hotkeys::HotkeyService>,
+    /// Action whose binding is currently being recorded (user clicked
+    /// "Record" in Settings → Hotkeys; we're waiting on the next
+    /// physical keypress to capture). `None` outside of recording.
+    pub(super) recording_action: Option<tempo::hotkeys::HotkeyAction>,
+
+    // === MPRIS D-Bus server ===
+    /// MPRIS server publishing playback state to the session bus so
+    /// the standard media keys (XF86AudioPlay/Next/Prev), GNOME's
+    /// "now playing" widget, KDE Connect, etc. all just work without
+    /// per-app config. `None` when we couldn't acquire the bus name
+    /// (most often: a second Tempo instance is already running).
+    pub(super) mpris_service: Option<tempo::mpris::MprisService>,
 }
 
 impl TempoApp {
@@ -2496,6 +2527,9 @@ impl TempoApp {
             saved_full_bounds: None,
             pending_window_swap: None,
             pending_window_title: None,
+            hotkey_service: None,
+            recording_action: None,
+            mpris_service: None,
         };
 
         app.artist_grid_scroll_handle
@@ -2565,6 +2599,15 @@ impl TempoApp {
             app.spawn_snapshot_rebuild("initial_build");
         }
         app.restart_metadata_worker();
+        // Boot the global hotkey service (evdev) and the MPRIS D-Bus
+        // server. Failures (no /dev/input access, no session bus,
+        // already-running instance) are logged and swallowed -- the
+        // app still works without them, just without remote-control
+        // surfaces.
+        perf::time("startup.start_global_hotkeys", "", || {
+            app.start_global_hotkeys(state.global_hotkeys.clone(), cx)
+        });
+        perf::time("startup.start_mpris", "", || app.start_mpris_server(cx));
         app
     }
 
