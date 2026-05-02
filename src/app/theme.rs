@@ -217,7 +217,14 @@ pub(super) fn bundled_themes() -> Vec<Theme> {
         include_str!("../../themes/nocturne.yaml"),
         include_str!("../../themes/blue-hour.yaml"),
         include_str!("../../themes/signal-green.yaml"),
+        include_str!("../../themes/midnight-plum.yaml"),
+        include_str!("../../themes/solar-flare.yaml"),
+        include_str!("../../themes/cocoa.yaml"),
+        include_str!("../../themes/forest-mist.yaml"),
+        include_str!("../../themes/mono-slate.yaml"),
+        include_str!("../../themes/cyberpunk-neon.yaml"),
         include_str!("../../themes/paper-dawn.yaml"),
+        include_str!("../../themes/rose-quartz.yaml"),
     ]
     .into_iter()
     .filter_map(|contents| Theme::from_yaml(contents).ok())

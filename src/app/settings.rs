@@ -531,17 +531,10 @@ impl TempoApp {
         let theme_colors = theme.colors;
         let selected = self.theme_id == theme.id;
         let theme_id = theme.id.clone();
-        let swatches = [
-            theme_colors.app,
-            theme_colors.surface,
-            theme_colors.elevated,
-            theme_colors.accent,
-            theme_colors.text_strong,
-        ];
 
         div()
             .id(SharedString::from(format!("theme-option-{}", theme.id)))
-            .min_h(px(58.0))
+            .min_h(px(72.0))
             .px_3()
             .py_2()
             .rounded_md()
@@ -587,21 +580,7 @@ impl TempoApp {
                             .child(theme.description.clone()),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .children(swatches.into_iter().map(|swatch| {
-                        div()
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(colors.border_strong))
-                            .bg(rgb(swatch))
-                    })),
-            )
+            .child(Self::render_theme_preview(theme_colors, colors))
             .child(
                 div()
                     .w(px(56.0))
@@ -617,6 +596,152 @@ impl TempoApp {
                 this.set_theme(&theme_id, cx);
                 cx.notify();
             }))
+    }
+
+    /// Inline mini-preview shown beside each theme row. Renders a tiny
+    /// mock of the app — a sidebar band, a content surface with an
+    /// accent pill and two faux "text" lines — followed by a column
+    /// of three labelled swatches (surface / elevated / accent). The
+    /// goal is for the preview to *feel* like the theme: when a user
+    /// scans the list, the mock should read as a thumbnail of what
+    /// switching to it would do, not just a bag of swatches.
+    ///
+    /// `host_colors` is the *currently active* theme; we use it only
+    /// for the outer frame border so the preview doesn't fight the
+    /// surrounding row chrome.
+    fn render_theme_preview(theme: ThemeColors, host_colors: ThemeColors) -> gpui::Div {
+        // Mini app mock: ~120x52px. Left "sidebar" column shows the
+        // panel + an accent dot; right side uses `surface` for the
+        // body, two short bars approximating list rows in `text` /
+        // `text_muted`, and an accent pill in the bottom-right hinting
+        // at the now-playing affordance.
+        let mock = div()
+            .w(px(120.0))
+            .h(px(52.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(host_colors.border_strong))
+            .overflow_hidden()
+            .flex()
+            .flex_none()
+            .child(
+                // Sidebar column.
+                div()
+                    .w(px(28.0))
+                    .h_full()
+                    .bg(rgb(theme.panel))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(theme.accent)),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(2.0))
+                            .rounded_sm()
+                            .bg(rgb(theme.text_muted)),
+                    )
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .h(px(2.0))
+                            .rounded_sm()
+                            .bg(rgb(theme.text_muted)),
+                    ),
+            )
+            .child(
+                // Surface body.
+                div()
+                    .flex_1()
+                    .h_full()
+                    .bg(rgb(theme.surface))
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .px_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w_full()
+                                    .h(px(3.0))
+                                    .rounded_sm()
+                                    .bg(rgb(theme.text_strong)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(48.0))
+                                    .h(px(2.0))
+                                    .rounded_sm()
+                                    .bg(rgb(theme.text_muted)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .w(px(36.0))
+                                    .h(px(6.0))
+                                    .rounded_sm()
+                                    .bg(rgb(theme.elevated))
+                                    .border_1()
+                                    .border_color(rgb(theme.border)),
+                            )
+                            .child(
+                                div()
+                                    .w(px(18.0))
+                                    .h(px(8.0))
+                                    .rounded_sm()
+                                    .bg(rgb(theme.accent)),
+                            ),
+                    ),
+            );
+
+        // Three labelled swatches (surface / elevated / accent) shown
+        // next to the mock. Smaller than before but legible — each
+        // square is a flat fill so the pure colour is unambiguous,
+        // unlike the mock which mixes them. Together the two halves
+        // give both a "feel" preview and an exact colour preview.
+        let swatch = |fill: u32| {
+            div()
+                .w(px(16.0))
+                .h(px(16.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(host_colors.border_strong))
+                .bg(rgb(fill))
+        };
+
+        let swatches = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(swatch(theme.surface))
+            .child(swatch(theme.elevated))
+            .child(swatch(theme.accent));
+
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(mock)
+            .child(swatches)
     }
 
     pub(super) fn render_output_settings(
