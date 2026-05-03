@@ -51,8 +51,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
+#[cfg(target_os = "linux")]
+use anyhow::Context as _;
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(target_os = "linux")]
 use evdev::{Device, EventSummary, KeyCode};
 use serde::{Deserialize, Serialize};
 
@@ -357,6 +360,24 @@ impl Drop for HotkeyService {
 /// `running` flag. Short enough that quitting feels instant.
 const EVENT_BLOCK_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[cfg(not(target_os = "linux"))]
+fn spawn_device_watchers(
+    _config: &Arc<RwLock<HotkeyConfig>>,
+    _recording: &Arc<RwLock<RecordingSlot>>,
+    _running: &Arc<AtomicBool>,
+    _event_tx: &Sender<HotkeyEvent>,
+) -> InitStatus {
+    // Global hotkeys on macOS/Windows would need entirely different
+    // backends (CGEventTap / RegisterHotKey). Until those are wired
+    // up, surface a clear "not available" status instead of failing.
+    InitStatus::NoInputDir(
+        "Global hotkeys are currently only supported on Linux (evdev). \
+         macOS and Windows backends are not yet implemented."
+            .to_string(),
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn spawn_device_watchers(
     config: &Arc<RwLock<HotkeyConfig>>,
     recording: &Arc<RwLock<RecordingSlot>>,
@@ -460,6 +481,7 @@ fn spawn_device_watchers(
 /// expose `EV_KEY` for buttons but won't have e.g. `KEY_A`, so this
 /// filter separates them from real keyboards. Matches the heuristic
 /// used by `libinput`.
+#[cfg(target_os = "linux")]
 fn is_keyboard(device: &Device) -> bool {
     if let Some(supported) = device.supported_keys() {
         supported.contains(KeyCode::KEY_A) && supported.contains(KeyCode::KEY_Z)
@@ -468,6 +490,7 @@ fn is_keyboard(device: &Device) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_device_watcher(
     dev_path: PathBuf,
     mut device: Device,
@@ -533,6 +556,7 @@ fn run_device_watcher(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn handle_key_event(
     code: KeyCode,
     value: i32,
@@ -618,90 +642,34 @@ fn handle_key_event(
 /// Settings UI ("SPACE" not " "), and (c) it's a closed set of keys
 /// users actually bind. Falls back to `KEY_<n>` for unknown codes.
 pub fn key_label(code: u16) -> String {
-    use evdev::KeyCode as K;
-    let kc = K::new(code);
-    let s = match kc {
-        K::KEY_SPACE => "SPACE",
-        K::KEY_ENTER => "ENTER",
-        K::KEY_TAB => "TAB",
-        K::KEY_ESC => "ESC",
-        K::KEY_BACKSPACE => "BACKSPACE",
-        K::KEY_INSERT => "INSERT",
-        K::KEY_DELETE => "DELETE",
-        K::KEY_HOME => "HOME",
-        K::KEY_END => "END",
-        K::KEY_PAGEUP => "PAGEUP",
-        K::KEY_PAGEDOWN => "PAGEDOWN",
-        K::KEY_UP => "UP",
-        K::KEY_DOWN => "DOWN",
-        K::KEY_LEFT => "LEFT",
-        K::KEY_RIGHT => "RIGHT",
-        K::KEY_COMMA => ",",
-        K::KEY_DOT => ".",
-        K::KEY_SLASH => "/",
-        K::KEY_SEMICOLON => ";",
-        K::KEY_APOSTROPHE => "'",
-        K::KEY_GRAVE => "`",
-        K::KEY_MINUS => "-",
-        K::KEY_EQUAL => "=",
-        K::KEY_LEFTBRACE => "[",
-        K::KEY_RIGHTBRACE => "]",
-        K::KEY_BACKSLASH => "\\",
-        K::KEY_F1 => "F1",
-        K::KEY_F2 => "F2",
-        K::KEY_F3 => "F3",
-        K::KEY_F4 => "F4",
-        K::KEY_F5 => "F5",
-        K::KEY_F6 => "F6",
-        K::KEY_F7 => "F7",
-        K::KEY_F8 => "F8",
-        K::KEY_F9 => "F9",
-        K::KEY_F10 => "F10",
-        K::KEY_F11 => "F11",
-        K::KEY_F12 => "F12",
-        K::KEY_PLAYPAUSE => "MEDIA_PLAYPAUSE",
-        K::KEY_NEXTSONG => "MEDIA_NEXT",
-        K::KEY_PREVIOUSSONG => "MEDIA_PREV",
-        K::KEY_STOPCD => "MEDIA_STOP",
-        K::KEY_VOLUMEUP => "VOL_UP",
-        K::KEY_VOLUMEDOWN => "VOL_DOWN",
-        K::KEY_MUTE => "MUTE",
-        K::KEY_A => "A",
-        K::KEY_B => "B",
-        K::KEY_C => "C",
-        K::KEY_D => "D",
-        K::KEY_E => "E",
-        K::KEY_F => "F",
-        K::KEY_G => "G",
-        K::KEY_H => "H",
-        K::KEY_I => "I",
-        K::KEY_J => "J",
-        K::KEY_K => "K",
-        K::KEY_L => "L",
-        K::KEY_M => "M",
-        K::KEY_N => "N",
-        K::KEY_O => "O",
-        K::KEY_P => "P",
-        K::KEY_Q => "Q",
-        K::KEY_R => "R",
-        K::KEY_S => "S",
-        K::KEY_T => "T",
-        K::KEY_U => "U",
-        K::KEY_V => "V",
-        K::KEY_W => "W",
-        K::KEY_X => "X",
-        K::KEY_Y => "Y",
-        K::KEY_Z => "Z",
-        K::KEY_0 => "0",
-        K::KEY_1 => "1",
-        K::KEY_2 => "2",
-        K::KEY_3 => "3",
-        K::KEY_4 => "4",
-        K::KEY_5 => "5",
-        K::KEY_6 => "6",
-        K::KEY_7 => "7",
-        K::KEY_8 => "8",
-        K::KEY_9 => "9",
+    // These are stable Linux kernel evdev keycodes (uapi/linux/input-event-codes.h).
+    // Hard-coded so the function compiles on every platform; `evdev` is
+    // a Linux-only dep (see Cargo.toml).
+    let s = match code {
+        // letters
+        30 => "A", 48 => "B", 46 => "C", 32 => "D", 18 => "E", 33 => "F",
+        34 => "G", 35 => "H", 23 => "I", 36 => "J", 37 => "K", 38 => "L",
+        50 => "M", 49 => "N", 24 => "O", 25 => "P", 16 => "Q", 19 => "R",
+        31 => "S", 20 => "T", 22 => "U", 47 => "V", 17 => "W", 45 => "X",
+        21 => "Y", 44 => "Z",
+        // digits (top row)
+        11 => "0", 2 => "1", 3 => "2", 4 => "3", 5 => "4",
+        6 => "5", 7 => "6", 8 => "7", 9 => "8", 10 => "9",
+        // function keys
+        59 => "F1", 60 => "F2", 61 => "F3", 62 => "F4", 63 => "F5",
+        64 => "F6", 65 => "F7", 66 => "F8", 67 => "F9", 68 => "F10",
+        87 => "F11", 88 => "F12",
+        // navigation / editing
+        57 => "SPACE", 28 => "ENTER", 15 => "TAB", 1 => "ESC",
+        14 => "BACKSPACE", 110 => "INSERT", 111 => "DELETE",
+        102 => "HOME", 107 => "END", 104 => "PAGEUP", 109 => "PAGEDOWN",
+        103 => "UP", 108 => "DOWN", 105 => "LEFT", 106 => "RIGHT",
+        // punctuation
+        51 => ",", 52 => ".", 53 => "/", 39 => ";", 40 => "'",
+        41 => "`", 12 => "-", 13 => "=", 26 => "[", 27 => "]", 43 => "\\",
+        // media keys
+        164 => "MEDIA_PLAYPAUSE", 163 => "MEDIA_NEXT", 165 => "MEDIA_PREV",
+        166 => "MEDIA_STOP", 115 => "VOL_UP", 114 => "VOL_DOWN", 113 => "MUTE",
         _ => return format!("KEY_{code}"),
     };
     s.to_string()
@@ -760,7 +728,7 @@ mod tests {
                 shift: true,
                 ..Default::default()
             },
-            key: evdev::KeyCode::KEY_SPACE.code(),
+            key: 57, // KEY_SPACE
         };
         assert_eq!(combo.display(), "CTRL+SHIFT+SPACE");
     }
@@ -769,7 +737,7 @@ mod tests {
     fn key_combo_display_no_modifiers() {
         let combo = KeyCombo {
             modifiers: Modifiers::default(),
-            key: evdev::KeyCode::KEY_F8.code(),
+            key: 66, // KEY_F8
         };
         assert_eq!(combo.display(), "F8");
     }
@@ -788,7 +756,7 @@ mod tests {
                 shift: true,
                 ..Default::default()
             },
-            key: evdev::KeyCode::KEY_SPACE.code(),
+            key: 57, // KEY_SPACE
         };
         let mut bindings = HashMap::new();
         bindings.insert(HotkeyAction::PlayPause, combo.clone());
@@ -797,7 +765,7 @@ mod tests {
 
         let other = KeyCombo {
             modifiers: Modifiers::default(),
-            key: evdev::KeyCode::KEY_X.code(),
+            key: 45, // KEY_X
         };
         assert_eq!(cfg.find_action(&other), None);
     }

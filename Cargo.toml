@@ -19,7 +19,6 @@ serde_yaml = "0.9.34"
 walkdir = "2.5.0"
 crossbeam-channel = "0.5.15"
 rayon = "1.12.0"
-evdev = "0.13"
 mpris-server = "0.10"
 async-io = "2"
 futures-util = "0.3"
@@ -32,6 +31,11 @@ rustfft = "6.4.1"
 # native paths (Shell_NotifyIconW / NSStatusItem) — see follow-up.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["async-io"] }
+
+# evdev is Linux-only (reads /dev/input/event*). On macOS/Windows the
+# hotkey module compiles a stub; see src/hotkeys.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
 
 [dev-dependencies]
 tempfile = "3.27.0"

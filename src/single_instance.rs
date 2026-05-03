@@ -101,7 +101,17 @@ mod imp {
             Ok(false)
         }
     }
+
+    /// Stub for platforms without a Unix-domain-socket-based handoff
+    /// (macOS and Windows). Always returns `Err` so callers fall
+    /// through to their normal startup path.
+    pub fn send_focus_request() -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "single-instance focus handoff is not implemented on this platform",
+        ))
+    }
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-pub use imp::SingleInstanceServer;
+pub use imp::{SingleInstanceServer, send_focus_request};
